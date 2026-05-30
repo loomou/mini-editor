@@ -66,17 +66,20 @@ pub struct Buffer {
     diagnostics: Vec<Diagnostic>,
     capability: Capability,
     saved_version: u64,
+    saved_text: String,
 }
 
 impl Buffer {
     pub fn local(id: BufferId, text: impl Into<String>) -> Self {
+        let text = text.into();
         Self {
-            text: TextBuffer::new(id, text),
+            text: TextBuffer::new(id, text.clone()),
             file: None,
             language_name: None,
             diagnostics: Vec::new(),
             capability: Capability::ReadWrite,
             saved_version: 0,
+            saved_text: text,
         }
     }
 
@@ -141,7 +144,27 @@ impl Buffer {
     }
 
     pub fn save(&mut self) {
+        let snapshot = self.text.snapshot();
+        self.saved_text = snapshot.text();
+        self.saved_version = snapshot.version();
+    }
+
+    pub fn revert_to_saved(&mut self) -> Result<bool, String> {
+        if !self.capability.editable() {
+            return Err("buffer is read-only".to_string());
+        }
+
+        let snapshot = self.text.snapshot();
+        if snapshot.text() == self.saved_text {
+            return Ok(false);
+        }
+
+        self.text.edit(TextEdit {
+            range: 0..snapshot.len(),
+            replacement: self.saved_text.clone(),
+        });
         self.saved_version = self.text.snapshot().version();
+        Ok(true)
     }
 }
 
@@ -186,5 +209,37 @@ mod tests {
         assert!(buffer.undo().unwrap());
         assert_eq!(buffer.snapshot().text.text(), "hello");
         assert!(buffer.snapshot().is_dirty());
+    }
+
+    #[test]
+    fn reverting_to_saved_text_restores_clean_buffer_contents() {
+        let mut buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            SourceFile::new("src/main.rs"),
+            "hello world",
+        );
+
+        buffer
+            .edit(TextEdit {
+                range: 6..11,
+                replacement: "zed".to_string(),
+            })
+            .unwrap();
+        assert_eq!(buffer.snapshot().text.text(), "hello zed");
+        assert!(buffer.snapshot().is_dirty());
+
+        assert!(buffer.revert_to_saved().unwrap());
+
+        assert_eq!(buffer.snapshot().text.text(), "hello world");
+        assert!(!buffer.snapshot().is_dirty());
+    }
+
+    #[test]
+    fn reverting_unchanged_buffer_is_a_noop() {
+        let mut buffer = Buffer::local(BufferId::new(1).unwrap(), "hello");
+
+        assert!(!buffer.revert_to_saved().unwrap());
+        assert_eq!(buffer.snapshot().text.text(), "hello");
+        assert!(!buffer.snapshot().is_dirty());
     }
 }

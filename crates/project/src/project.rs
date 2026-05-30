@@ -85,6 +85,24 @@ impl BufferStore {
         Ok(dirty_paths)
     }
 
+    pub fn revert_buffer(&mut self, path: &ProjectPath) -> io::Result<bool> {
+        let buffer = self.buffer_for_path(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no open buffer for {}", path.path.display()),
+            )
+        })?;
+        buffer
+            .borrow_mut()
+            .revert_to_saved()
+            .map_err(io::Error::other)
+    }
+
+    pub fn close_buffer(&mut self, path: &ProjectPath) -> Option<BufferHandle> {
+        let buffer_id = self.path_to_buffer_id.remove(path)?;
+        self.buffers.remove(&buffer_id)
+    }
+
     pub fn buffer_for_path(&self, path: &ProjectPath) -> Option<BufferHandle> {
         self.path_to_buffer_id
             .get(path)
@@ -155,6 +173,14 @@ impl Project {
 
     pub fn save_dirty_buffers(&mut self) -> io::Result<Vec<ProjectPath>> {
         self.buffer_store.save_dirty_buffers()
+    }
+
+    pub fn revert_buffer(&mut self, path: &ProjectPath) -> io::Result<bool> {
+        self.buffer_store.revert_buffer(path)
+    }
+
+    pub fn close_buffer(&mut self, path: &ProjectPath) -> Option<BufferHandle> {
+        self.buffer_store.close_buffer(path)
     }
 
     pub fn dirty_buffers(&self) -> Vec<ProjectPath> {
@@ -322,5 +348,46 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&clean_path).unwrap(), "clean file");
         assert!(!project.has_dirty_buffers());
         assert_eq!(project.dirty_buffers(), Vec::<ProjectPath>::new());
+    }
+
+    #[test]
+    fn reverting_open_buffer_restores_saved_text_without_writing_disk() {
+        let file_path = test_file_path("revert-buffer");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "hello world").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut editor = project.open_editor_from_file(path.clone()).unwrap();
+
+        editor.select(6..11);
+        editor.insert_text("zed").unwrap();
+        assert!(project.has_dirty_buffers());
+
+        assert!(project.revert_buffer(&path).unwrap());
+
+        let buffer = project.buffer_store().buffer_for_path(&path).unwrap();
+        assert_eq!(buffer.borrow().snapshot().text.text(), "hello world");
+        assert!(!project.has_dirty_buffers());
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn closing_buffer_removes_path_identity_from_project_store() {
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, "src/main.rs");
+        let first = project.open_buffer(path.clone(), "first");
+
+        let closed = project.close_buffer(&path).unwrap();
+
+        assert!(std::rc::Rc::ptr_eq(&first, &closed));
+        assert!(project.buffer_store().is_empty());
+        assert!(project.buffer_store().buffer_for_path(&path).is_none());
+
+        let reopened = project.open_buffer(path.clone(), "second");
+
+        assert!(!std::rc::Rc::ptr_eq(&first, &reopened));
+        assert_eq!(reopened.borrow().snapshot().text.text(), "second");
+        assert_eq!(project.buffer_store().len(), 1);
     }
 }
