@@ -1,17 +1,16 @@
 [package]
-name = "editor"
+name = "display"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-path = "src/editor.rs"
+path = "src/display.rs"
 doctest = false
 
 [dependencies]
-display.workspace = true
-language.workspace = true
 multibuffer.workspace = true
 
 [dev-dependencies]
+language.workspace = true
 text.workspace = true

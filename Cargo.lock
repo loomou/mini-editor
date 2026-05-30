@@ -3,9 +3,19 @@
 version = 4
 
 [[package]]
+name = "display"
+version = "0.1.0"
+dependencies = [
+ "language",
+ "multibuffer",
+ "text",
+]
+
+[[package]]
 name = "editor"
 version = "0.1.0"
 dependencies = [
+ "display",
  "language",
  "multibuffer",
  "text",

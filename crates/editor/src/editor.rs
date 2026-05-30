@@ -1,3 +1,4 @@
+use display::{DisplayMap, DisplaySnapshot};
 use language::BufferHandle;
 use multibuffer::{MultiBuffer, MultiBufferSnapshot};
 use std::ops::Range;
@@ -23,6 +24,10 @@ impl EditorModel {
 
     pub fn snapshot(&self) -> MultiBufferSnapshot {
         self.buffer.snapshot()
+    }
+
+    pub fn display_snapshot(&self, soft_wrap_column: Option<usize>) -> DisplaySnapshot {
+        DisplayMap::new(soft_wrap_column).snapshot(&self.snapshot())
     }
 
     pub fn selections(&self) -> &[Selection] {
@@ -65,5 +70,16 @@ mod tests {
 
         assert_eq!(editor.snapshot().text(), "hello zed");
         assert_eq!(editor.selections()[0].range, 9..9);
+    }
+
+    #[test]
+    fn display_snapshot_wraps_editor_text() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
+        let editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        let display = editor.display_snapshot(Some(3));
+
+        assert_eq!(display.rows()[0].text, "abc");
+        assert_eq!(display.rows()[1].text, "def");
     }
 }
