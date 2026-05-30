@@ -1,6 +1,8 @@
 use editor::EditorModel;
 use language::{Buffer, BufferHandle, SourceFile};
 use std::collections::BTreeMap;
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 use text::BufferId;
 
@@ -49,6 +51,32 @@ impl BufferStore {
         buffer
     }
 
+    pub fn open_local_file(&mut self, path: ProjectPath) -> io::Result<BufferHandle> {
+        if let Some(buffer) = self.buffer_for_path(&path) {
+            return Ok(buffer);
+        }
+
+        let text = fs::read_to_string(&path.path)?;
+        Ok(self.open_buffer(path, text))
+    }
+
+    pub fn save_buffer(&mut self, path: &ProjectPath) -> io::Result<()> {
+        let buffer = self.buffer_for_path(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no open buffer for {}", path.path.display()),
+            )
+        })?;
+        let text = buffer.borrow().snapshot().text.text();
+
+        if let Some(parent) = path.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path.path, text)?;
+        buffer.borrow_mut().save();
+        Ok(())
+    }
+
     pub fn buffer_for_path(&self, path: &ProjectPath) -> Option<BufferHandle> {
         self.path_to_buffer_id
             .get(path)
@@ -79,10 +107,24 @@ impl Project {
         self.buffer_store.open_buffer(path, text)
     }
 
+    pub fn open_local_file(&mut self, path: ProjectPath) -> io::Result<BufferHandle> {
+        self.buffer_store.open_local_file(path)
+    }
+
     pub fn open_editor(&mut self, path: ProjectPath, text: impl Into<String>) -> EditorModel {
         let path_key = path.path_key();
         let buffer = self.open_buffer(path, text);
         EditorModel::for_buffer(path_key, buffer)
+    }
+
+    pub fn open_editor_from_file(&mut self, path: ProjectPath) -> io::Result<EditorModel> {
+        let path_key = path.path_key();
+        let buffer = self.open_local_file(path)?;
+        Ok(EditorModel::for_buffer(path_key, buffer))
+    }
+
+    pub fn save_buffer(&mut self, path: &ProjectPath) -> io::Result<()> {
+        self.buffer_store.save_buffer(path)
     }
 
     pub fn buffer_store(&self) -> &BufferStore {
@@ -93,6 +135,20 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_file_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("mini_project_tests")
+            .join(format!("{name}-{unique}.txt"))
+    }
 
     #[test]
     fn opening_the_same_path_reuses_the_same_buffer_handle() {
@@ -118,5 +174,44 @@ mod tests {
 
         let buffer = project.buffer_store().buffer_for_path(&path).unwrap();
         assert_eq!(buffer.borrow().snapshot().text.text(), "hello zed");
+    }
+
+    #[test]
+    fn opening_local_file_reads_disk_and_reuses_open_buffer() {
+        let file_path = test_file_path("open-local-file");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "from disk").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path.clone());
+        let first = project.open_local_file(path.clone()).unwrap();
+
+        std::fs::write(&file_path, "changed on disk").unwrap();
+        let second = project.open_local_file(path).unwrap();
+
+        assert!(std::rc::Rc::ptr_eq(&first, &second));
+        assert_eq!(second.borrow().snapshot().text.text(), "from disk");
+    }
+
+    #[test]
+    fn saving_open_buffer_writes_disk_and_marks_buffer_clean() {
+        let file_path = test_file_path("save-buffer");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "hello world").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut editor = project.open_editor_from_file(path.clone()).unwrap();
+
+        editor.select(6..11);
+        editor.insert_text("zed").unwrap();
+        let buffer = project.buffer_store().buffer_for_path(&path).unwrap();
+        assert!(buffer.borrow().snapshot().is_dirty());
+
+        project.save_buffer(&path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "hello zed");
+        let buffer = project.buffer_store().buffer_for_path(&path).unwrap();
+        assert!(!buffer.borrow().snapshot().is_dirty());
     }
 }
