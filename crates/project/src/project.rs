@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use text::BufferId;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,11 +26,18 @@ impl ProjectPath {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileMetadata {
+    pub modified: Option<SystemTime>,
+    pub len: Option<u64>,
+}
+
 #[derive(Debug, Default)]
 pub struct BufferStore {
     next_buffer_id: u64,
     buffers: BTreeMap<BufferId, BufferHandle>,
     path_to_buffer_id: BTreeMap<ProjectPath, BufferId>,
+    file_metadata: BTreeMap<ProjectPath, FileMetadata>,
 }
 
 impl BufferStore {
@@ -47,6 +55,8 @@ impl BufferStore {
         let buffer = Buffer::from_file(buffer_id, SourceFile::new(path.path.clone()), text);
         let buffer = buffer.into_handle();
         self.buffers.insert(buffer_id, buffer.clone());
+        self.file_metadata
+            .insert(path.clone(), FileMetadata::missing());
         self.path_to_buffer_id.insert(path, buffer_id);
         buffer
     }
@@ -57,7 +67,10 @@ impl BufferStore {
         }
 
         let text = fs::read_to_string(&path.path)?;
-        Ok(self.open_buffer(path, text))
+        let metadata = read_file_metadata(&path);
+        let buffer = self.open_buffer(path.clone(), text);
+        self.file_metadata.insert(path, metadata);
+        Ok(buffer)
     }
 
     pub fn save_buffer(&mut self, path: &ProjectPath) -> io::Result<()> {
@@ -74,6 +87,8 @@ impl BufferStore {
         }
         fs::write(&path.path, text)?;
         buffer.borrow_mut().save();
+        self.file_metadata
+            .insert(path.clone(), read_file_metadata(path));
         Ok(())
     }
 
@@ -98,9 +113,57 @@ impl BufferStore {
             .map_err(io::Error::other)
     }
 
+    pub fn reload_buffer(&mut self, path: &ProjectPath) -> io::Result<bool> {
+        let buffer = self.buffer_for_path(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no open buffer for {}", path.path.display()),
+            )
+        })?;
+        if buffer.borrow().snapshot().is_dirty() {
+            return Err(io::Error::other(format!(
+                "cannot reload dirty buffer {}",
+                path.path.display()
+            )));
+        }
+
+        let text = fs::read_to_string(&path.path)?;
+        let changed = buffer.borrow_mut().reload_saved_text(text);
+        self.file_metadata
+            .insert(path.clone(), read_file_metadata(path));
+        Ok(changed)
+    }
+
+    pub fn force_reload_buffer(&mut self, path: &ProjectPath) -> io::Result<bool> {
+        let buffer = self.buffer_for_path(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no open buffer for {}", path.path.display()),
+            )
+        })?;
+        let text = fs::read_to_string(&path.path)?;
+        let changed = buffer.borrow_mut().reload_saved_text(text);
+        self.file_metadata
+            .insert(path.clone(), read_file_metadata(path));
+        Ok(changed)
+    }
+
     pub fn close_buffer(&mut self, path: &ProjectPath) -> Option<BufferHandle> {
         let buffer_id = self.path_to_buffer_id.remove(path)?;
+        self.file_metadata.remove(path);
         self.buffers.remove(&buffer_id)
+    }
+
+    pub fn file_metadata(&self, path: &ProjectPath) -> Option<&FileMetadata> {
+        self.file_metadata.get(path)
+    }
+
+    pub fn has_external_change(&self, path: &ProjectPath) -> Option<bool> {
+        let known = self.file_metadata.get(path)?;
+        if known.modified.is_none() && known.len.is_none() {
+            return Some(false);
+        }
+        Some(&read_file_metadata(path) != known)
     }
 
     pub fn buffer_for_path(&self, path: &ProjectPath) -> Option<BufferHandle> {
@@ -134,6 +197,25 @@ impl BufferStore {
 
     pub fn is_empty(&self) -> bool {
         self.buffers.is_empty()
+    }
+}
+
+impl FileMetadata {
+    fn missing() -> Self {
+        Self {
+            modified: None,
+            len: None,
+        }
+    }
+}
+
+fn read_file_metadata(path: &ProjectPath) -> FileMetadata {
+    let Ok(metadata) = fs::metadata(&path.path) else {
+        return FileMetadata::missing();
+    };
+    FileMetadata {
+        modified: metadata.modified().ok(),
+        len: Some(metadata.len()),
     }
 }
 
@@ -179,8 +261,24 @@ impl Project {
         self.buffer_store.revert_buffer(path)
     }
 
+    pub fn reload_buffer(&mut self, path: &ProjectPath) -> io::Result<bool> {
+        self.buffer_store.reload_buffer(path)
+    }
+
+    pub fn force_reload_buffer(&mut self, path: &ProjectPath) -> io::Result<bool> {
+        self.buffer_store.force_reload_buffer(path)
+    }
+
     pub fn close_buffer(&mut self, path: &ProjectPath) -> Option<BufferHandle> {
         self.buffer_store.close_buffer(path)
+    }
+
+    pub fn file_metadata(&self, path: &ProjectPath) -> Option<&FileMetadata> {
+        self.buffer_store.file_metadata(path)
+    }
+
+    pub fn has_external_change(&self, path: &ProjectPath) -> Option<bool> {
+        self.buffer_store.has_external_change(path)
     }
 
     pub fn dirty_buffers(&self) -> Vec<ProjectPath> {
@@ -383,11 +481,157 @@ mod tests {
         assert!(std::rc::Rc::ptr_eq(&first, &closed));
         assert!(project.buffer_store().is_empty());
         assert!(project.buffer_store().buffer_for_path(&path).is_none());
+        assert!(project.file_metadata(&path).is_none());
 
         let reopened = project.open_buffer(path.clone(), "second");
 
         assert!(!std::rc::Rc::ptr_eq(&first, &reopened));
         assert_eq!(reopened.borrow().snapshot().text.text(), "second");
         assert_eq!(project.buffer_store().len(), 1);
+    }
+
+    #[test]
+    fn opening_local_file_records_file_metadata() {
+        let file_path = test_file_path("open-metadata");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "from disk").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path);
+        project.open_local_file(path.clone()).unwrap();
+
+        let metadata = project.file_metadata(&path).unwrap();
+        assert!(metadata.modified.is_some());
+        assert_eq!(metadata.len, Some("from disk".len() as u64));
+    }
+
+    #[test]
+    fn saving_and_reloading_refresh_file_metadata() {
+        let file_path = test_file_path("refresh-metadata");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "from disk").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut editor = project.open_editor_from_file(path.clone()).unwrap();
+
+        editor.select(0..4);
+        editor.insert_text("saved").unwrap();
+        project.save_buffer(&path).unwrap();
+        assert!(project.file_metadata(&path).unwrap().modified.is_some());
+        assert_eq!(
+            project.file_metadata(&path).unwrap().len,
+            Some("saved disk".len() as u64)
+        );
+
+        std::fs::write(&file_path, "changed on disk").unwrap();
+        project.reload_buffer(&path).unwrap();
+
+        assert!(project.file_metadata(&path).unwrap().modified.is_some());
+        assert_eq!(
+            project.file_metadata(&path).unwrap().len,
+            Some("changed on disk".len() as u64)
+        );
+    }
+
+    #[test]
+    fn external_change_detection_compares_current_disk_metadata() {
+        let file_path = test_file_path("external-change");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "old").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path.clone());
+        project.open_local_file(path.clone()).unwrap();
+
+        assert_eq!(project.has_external_change(&path), Some(false));
+
+        std::fs::write(&file_path, "changed length").unwrap();
+
+        assert_eq!(project.has_external_change(&path), Some(true));
+
+        project.reload_buffer(&path).unwrap();
+
+        assert_eq!(project.has_external_change(&path), Some(false));
+    }
+
+    #[test]
+    fn external_change_detection_is_unknown_after_buffer_closes() {
+        let file_path = test_file_path("external-change-closed");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "old").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path);
+        project.open_local_file(path.clone()).unwrap();
+        project.close_buffer(&path);
+
+        assert_eq!(project.has_external_change(&path), None);
+    }
+
+    #[test]
+    fn reloading_clean_open_buffer_reads_new_disk_contents() {
+        let file_path = test_file_path("reload-clean");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "from disk").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path.clone());
+        project.open_local_file(path.clone()).unwrap();
+
+        std::fs::write(&file_path, "changed on disk").unwrap();
+
+        assert!(project.reload_buffer(&path).unwrap());
+
+        let buffer = project.buffer_store().buffer_for_path(&path).unwrap();
+        assert_eq!(buffer.borrow().snapshot().text.text(), "changed on disk");
+        assert!(!buffer.borrow().snapshot().is_dirty());
+    }
+
+    #[test]
+    fn reloading_dirty_open_buffer_is_rejected() {
+        let file_path = test_file_path("reload-dirty");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "from disk").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut editor = project.open_editor_from_file(path.clone()).unwrap();
+        editor.select(0..4);
+        editor.insert_text("buffer").unwrap();
+
+        std::fs::write(&file_path, "changed on disk").unwrap();
+
+        let error = project.reload_buffer(&path).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("cannot reload dirty buffer {}", file_path.display())
+        );
+        let buffer = project.buffer_store().buffer_for_path(&path).unwrap();
+        assert_eq!(buffer.borrow().snapshot().text.text(), "buffer disk");
+        assert!(buffer.borrow().snapshot().is_dirty());
+    }
+
+    #[test]
+    fn force_reloading_dirty_open_buffer_replaces_unsaved_text() {
+        let file_path = test_file_path("force-reload-dirty");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "from disk").unwrap();
+
+        let mut project = Project::new();
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut editor = project.open_editor_from_file(path.clone()).unwrap();
+        editor.select(0..4);
+        editor.insert_text("buffer").unwrap();
+
+        std::fs::write(&file_path, "changed on disk").unwrap();
+
+        assert!(project.force_reload_buffer(&path).unwrap());
+
+        let buffer = project.buffer_store().buffer_for_path(&path).unwrap();
+        assert_eq!(buffer.borrow().snapshot().text.text(), "changed on disk");
+        assert!(!buffer.borrow().snapshot().is_dirty());
+        assert_eq!(project.has_external_change(&path), Some(false));
     }
 }

@@ -166,6 +166,25 @@ impl Buffer {
         self.saved_version = self.text.snapshot().version();
         Ok(true)
     }
+
+    pub fn reload_saved_text(&mut self, text: impl Into<String>) -> bool {
+        let text = text.into();
+        let snapshot = self.text.snapshot();
+
+        if snapshot.text() == text {
+            self.saved_text = text;
+            self.saved_version = snapshot.version();
+            return false;
+        }
+
+        self.text.edit(TextEdit {
+            range: 0..snapshot.len(),
+            replacement: text.clone(),
+        });
+        self.saved_text = text;
+        self.saved_version = self.text.snapshot().version();
+        true
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +258,30 @@ mod tests {
         let mut buffer = Buffer::local(BufferId::new(1).unwrap(), "hello");
 
         assert!(!buffer.revert_to_saved().unwrap());
+        assert_eq!(buffer.snapshot().text.text(), "hello");
+        assert!(!buffer.snapshot().is_dirty());
+    }
+
+    #[test]
+    fn reloading_saved_text_replaces_contents_and_marks_buffer_clean() {
+        let mut buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            SourceFile::new("src/main.rs"),
+            "hello world",
+        );
+
+        assert!(buffer.reload_saved_text("hello zed"));
+
+        assert_eq!(buffer.snapshot().text.text(), "hello zed");
+        assert!(!buffer.snapshot().is_dirty());
+    }
+
+    #[test]
+    fn reloading_same_saved_text_is_a_noop() {
+        let mut buffer = Buffer::local(BufferId::new(1).unwrap(), "hello");
+
+        assert!(!buffer.reload_saved_text("hello"));
+
         assert_eq!(buffer.snapshot().text.text(), "hello");
         assert!(!buffer.snapshot().is_dirty());
     }

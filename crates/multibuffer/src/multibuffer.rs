@@ -220,6 +220,14 @@ impl MultiBuffer {
         Ok(changed)
     }
 
+    pub fn refresh(&mut self) {
+        if self.buffers.len() == 1 && self.excerpts.len() == 1 {
+            if let Some(buffer_id) = self.excerpts.first().map(|excerpt| excerpt.buffer_id) {
+                self.refresh_singleton_excerpt(buffer_id);
+            }
+        }
+    }
+
     fn singleton_buffer(&self) -> Result<(BufferId, BufferHandle), String> {
         if self.buffers.len() != 1 || self.excerpts.len() != 1 {
             return Err("this teaching step only supports singleton undo/redo".to_string());
@@ -303,5 +311,21 @@ mod tests {
         multibuffer.edit(6..11, "zed").unwrap();
 
         assert!(multibuffer.snapshot().is_dirty());
+    }
+
+    #[test]
+    fn refresh_updates_singleton_excerpt_after_external_buffer_change() {
+        let buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            SourceFile::new("src/main.rs"),
+            "old",
+        )
+        .into_handle();
+        let mut multibuffer = MultiBuffer::singleton("src/main.rs", buffer.clone());
+
+        buffer.borrow_mut().reload_saved_text("new longer text");
+        multibuffer.refresh();
+
+        assert_eq!(multibuffer.snapshot().text(), "new longer text");
     }
 }

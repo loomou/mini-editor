@@ -47,6 +47,51 @@ pub struct RenderedLine {
     pub selection_ranges: Vec<Range<usize>>,
 }
 
+impl RenderedLine {
+    pub fn text_with_cursors(&self) -> String {
+        let mut text = self.text.clone();
+        let mut cursor_columns = self.cursor_columns.clone();
+        cursor_columns.sort_unstable();
+        cursor_columns.dedup();
+
+        for column in cursor_columns.into_iter().rev() {
+            if column <= text.len() && text.is_char_boundary(column) {
+                text.insert(column, '|');
+            }
+        }
+
+        text
+    }
+
+    pub fn text_with_overlays(&self) -> String {
+        let mut text = self.text.clone();
+        let mut markers = Vec::new();
+
+        for range in &self.selection_ranges {
+            markers.push((range.start, '['));
+            markers.push((range.end, ']'));
+        }
+        for column in &self.cursor_columns {
+            markers.push((*column, '|'));
+        }
+
+        markers.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| marker_priority(left.1).cmp(&marker_priority(right.1)))
+        });
+
+        for (column, marker) in markers {
+            if column <= text.len() && text.is_char_boundary(column) {
+                text.insert(column, marker);
+            }
+        }
+
+        text
+    }
+}
+
 impl EditorView {
     pub fn new(editor: EditorModel) -> Self {
         Self { editor }
@@ -84,6 +129,10 @@ impl EditorView {
         }
     }
 
+    pub fn refresh_buffer_ranges(&mut self) {
+        self.editor.refresh_buffer_ranges();
+    }
+
     pub fn rendered_lines(&self, soft_wrap_column: Option<usize>) -> Vec<RenderedLine> {
         let display = self.editor.display_snapshot(soft_wrap_column);
         let cursor = self.editor.cursor_display_point(soft_wrap_column).ok();
@@ -113,5 +162,14 @@ impl EditorView {
                     .collect(),
             })
             .collect()
+    }
+}
+
+fn marker_priority(marker: char) -> usize {
+    match marker {
+        '|' => 0,
+        ']' => 1,
+        '[' => 2,
+        _ => 3,
     }
 }

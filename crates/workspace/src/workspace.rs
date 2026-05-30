@@ -10,6 +10,8 @@ pub enum WorkspaceCommand {
     CloseActiveEditor,
     SaveAndCloseActiveEditor,
     DiscardAndCloseActiveEditor,
+    ReloadActiveEditor,
+    ForceReloadActiveEditor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +19,8 @@ pub struct WorkspaceCommandOutcome {
     pub editor: Option<CommandOutcome>,
     pub saved_paths: Vec<ProjectPath>,
     pub closed_path: Option<ProjectPath>,
+    pub reloaded_path: Option<ProjectPath>,
+    pub reload_changed_text: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,13 +35,18 @@ pub struct RenderedTab {
     pub title: String,
     pub is_active: bool,
     pub is_dirty: bool,
+    pub has_external_change: bool,
 }
 
 impl RenderedTab {
     pub fn label_text(&self) -> String {
         let active_marker = if self.is_active { '>' } else { ' ' };
         let dirty_marker = if self.is_dirty { '*' } else { ' ' };
-        format!("{active_marker}{dirty_marker} {}", self.title)
+        let external_marker = if self.has_external_change { '!' } else { ' ' };
+        format!(
+            "{active_marker}{dirty_marker}{external_marker} {}",
+            self.title
+        )
     }
 }
 
@@ -52,6 +61,12 @@ pub struct Workspace {
 struct WorkspaceEditor {
     path: ProjectPath,
     view: EditorView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReloadOutcome {
+    pub path: ProjectPath,
+    pub changed_text: bool,
 }
 
 impl Workspace {
@@ -100,6 +115,8 @@ impl Workspace {
                     editor: Some(editor.dispatch_command(command)?),
                     saved_paths: Vec::new(),
                     closed_path: None,
+                    reloaded_path: None,
+                    reload_changed_text: false,
                 })
             }
             WorkspaceCommand::SaveAll => Ok(WorkspaceCommandOutcome {
@@ -109,22 +126,50 @@ impl Workspace {
                     .save_dirty_buffers()
                     .map_err(|error| error.to_string())?,
                 closed_path: None,
+                reloaded_path: None,
+                reload_changed_text: false,
             }),
             WorkspaceCommand::CloseActiveEditor => Ok(WorkspaceCommandOutcome {
                 editor: None,
                 saved_paths: Vec::new(),
                 closed_path: Some(self.close_active_editor()?),
+                reloaded_path: None,
+                reload_changed_text: false,
             }),
             WorkspaceCommand::SaveAndCloseActiveEditor => Ok(WorkspaceCommandOutcome {
                 editor: None,
                 saved_paths: Vec::new(),
                 closed_path: Some(self.save_and_close_active_editor()?),
+                reloaded_path: None,
+                reload_changed_text: false,
             }),
             WorkspaceCommand::DiscardAndCloseActiveEditor => Ok(WorkspaceCommandOutcome {
                 editor: None,
                 saved_paths: Vec::new(),
                 closed_path: Some(self.discard_and_close_active_editor()?),
+                reloaded_path: None,
+                reload_changed_text: false,
             }),
+            WorkspaceCommand::ReloadActiveEditor => {
+                let reload = self.reload_active_editor()?;
+                Ok(WorkspaceCommandOutcome {
+                    editor: None,
+                    saved_paths: Vec::new(),
+                    closed_path: None,
+                    reloaded_path: Some(reload.path),
+                    reload_changed_text: reload.changed_text,
+                })
+            }
+            WorkspaceCommand::ForceReloadActiveEditor => {
+                let reload = self.force_reload_active_editor()?;
+                Ok(WorkspaceCommandOutcome {
+                    editor: None,
+                    saved_paths: Vec::new(),
+                    closed_path: None,
+                    reloaded_path: Some(reload.path),
+                    reload_changed_text: reload.changed_text,
+                })
+            }
         }
     }
 
@@ -150,6 +195,10 @@ impl Workspace {
                         title: rendered.title,
                         is_active: self.active_index == Some(index),
                         is_dirty: rendered.is_dirty,
+                        has_external_change: self
+                            .project
+                            .has_external_change(&editor.path)
+                            .unwrap_or(false),
                     }
                 })
                 .collect(),
@@ -224,6 +273,46 @@ impl Workspace {
         self.close_editor_at(index, DirtyClosePolicy::Discard)
     }
 
+    pub fn reload_editor(&mut self, path: &ProjectPath) -> Result<ReloadOutcome, String> {
+        let changed_text = self
+            .project
+            .reload_buffer(path)
+            .map_err(|error| error.to_string())?;
+        self.refresh_editor_for_path(path);
+        Ok(ReloadOutcome {
+            path: path.clone(),
+            changed_text,
+        })
+    }
+
+    pub fn reload_active_editor(&mut self) -> Result<ReloadOutcome, String> {
+        let path = self
+            .active_path()
+            .ok_or_else(|| "workspace has no active editor".to_string())?
+            .clone();
+        self.reload_editor(&path)
+    }
+
+    pub fn force_reload_editor(&mut self, path: &ProjectPath) -> Result<ReloadOutcome, String> {
+        let changed_text = self
+            .project
+            .force_reload_buffer(path)
+            .map_err(|error| error.to_string())?;
+        self.refresh_editor_for_path(path);
+        Ok(ReloadOutcome {
+            path: path.clone(),
+            changed_text,
+        })
+    }
+
+    pub fn force_reload_active_editor(&mut self) -> Result<ReloadOutcome, String> {
+        let path = self
+            .active_path()
+            .ok_or_else(|| "workspace has no active editor".to_string())?
+            .clone();
+        self.force_reload_editor(&path)
+    }
+
     pub fn project(&self) -> &Project {
         &self.project
     }
@@ -255,6 +344,16 @@ impl Workspace {
             .get_mut(index)
             .map(|editor| &mut editor.view)
             .ok_or_else(|| "workspace active editor is missing".to_string())
+    }
+
+    fn refresh_editor_for_path(&mut self, path: &ProjectPath) {
+        if let Some(editor) = self
+            .open_editors
+            .iter_mut()
+            .find(|editor| editor.path == *path)
+        {
+            editor.view.refresh_buffer_ranges();
+        }
     }
 
     fn close_editor_at(
@@ -457,9 +556,9 @@ mod tests {
 
         assert_eq!(rendered.tabs.len(), 2);
         assert_eq!(rendered.tabs[0].path, first);
-        assert_eq!(rendered.tabs[0].label_text(), " * src/first.rs");
+        assert_eq!(rendered.tabs[0].label_text(), " *  src/first.rs");
         assert_eq!(rendered.tabs[1].path, second);
-        assert_eq!(rendered.tabs[1].label_text(), ">  src/second.rs");
+        assert_eq!(rendered.tabs[1].label_text(), ">   src/second.rs");
         assert_eq!(rendered.active_editor.unwrap().title, "src/second.rs");
     }
 
@@ -544,6 +643,41 @@ mod tests {
     }
 
     #[test]
+    fn rendered_workspace_marks_tabs_with_external_file_changes() {
+        let file_path = test_file_path("external-change-tab");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "old").unwrap();
+
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut workspace = Workspace::new();
+        workspace.open_editor_from_file(path.clone()).unwrap();
+
+        assert_eq!(
+            workspace.rendered_workspace(None).tabs[0].label_text(),
+            format!(">   {}", file_path.display())
+        );
+
+        std::fs::write(&file_path, "changed length").unwrap();
+
+        let rendered = workspace.rendered_workspace(None);
+
+        assert!(rendered.tabs[0].has_external_change);
+        assert_eq!(
+            rendered.tabs[0].label_text(),
+            format!("> ! {}", file_path.display())
+        );
+
+        workspace.reload_active_editor().unwrap();
+
+        let rendered = workspace.rendered_workspace(None);
+        assert!(!rendered.tabs[0].has_external_change);
+        assert_eq!(
+            rendered.tabs[0].label_text(),
+            format!(">   {}", file_path.display())
+        );
+    }
+
+    #[test]
     fn save_and_close_active_editor_writes_dirty_file_before_closing() {
         let file_path = test_file_path("save-and-close");
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
@@ -621,5 +755,141 @@ mod tests {
                 .buffer_for_path(&second)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn reload_active_editor_refreshes_clean_buffer_from_disk() {
+        let file_path = test_file_path("reload-active-clean");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "old text").unwrap();
+
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut workspace = Workspace::new();
+        workspace.open_editor_from_file(path.clone()).unwrap();
+
+        std::fs::write(&file_path, "new text").unwrap();
+
+        let outcome = workspace
+            .dispatch_command(WorkspaceCommand::ReloadActiveEditor)
+            .unwrap();
+
+        assert_eq!(outcome.reloaded_path, Some(path));
+        assert!(outcome.reload_changed_text);
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "new text"
+        );
+        assert!(!workspace.project().has_dirty_buffers());
+    }
+
+    #[test]
+    fn reload_active_editor_clamps_cursor_when_disk_text_is_shorter() {
+        let file_path = test_file_path("reload-active-clamps-cursor");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "hello world").unwrap();
+
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut workspace = Workspace::new();
+        workspace.open_editor_from_file(path).unwrap();
+        for _ in 0.."hello world".len() {
+            workspace
+                .dispatch_command(WorkspaceCommand::Editor(EditorCommand::MoveRight {
+                    extend: false,
+                }))
+                .unwrap();
+        }
+
+        std::fs::write(&file_path, "hello").unwrap();
+
+        workspace
+            .dispatch_command(WorkspaceCommand::ReloadActiveEditor)
+            .unwrap();
+
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text_with_overlays(),
+            "hello|"
+        );
+    }
+
+    #[test]
+    fn reload_active_editor_reports_no_text_change_when_disk_matches_buffer() {
+        let file_path = test_file_path("reload-active-unchanged");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "same text").unwrap();
+
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut workspace = Workspace::new();
+        workspace.open_editor_from_file(path.clone()).unwrap();
+
+        let outcome = workspace
+            .dispatch_command(WorkspaceCommand::ReloadActiveEditor)
+            .unwrap();
+
+        assert_eq!(outcome.reloaded_path, Some(path));
+        assert!(!outcome.reload_changed_text);
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "same text"
+        );
+        assert!(!workspace.project().has_dirty_buffers());
+    }
+
+    #[test]
+    fn reload_active_editor_rejects_dirty_buffer() {
+        let file_path = test_file_path("reload-active-dirty");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "old text").unwrap();
+
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut workspace = Workspace::new();
+        workspace.open_editor_from_file(path).unwrap();
+        workspace
+            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('/')))
+            .unwrap();
+
+        std::fs::write(&file_path, "new text").unwrap();
+
+        let error = workspace
+            .dispatch_command(WorkspaceCommand::ReloadActiveEditor)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            format!("cannot reload dirty buffer {}", file_path.display())
+        );
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "/old text"
+        );
+        assert!(workspace.project().has_dirty_buffers());
+    }
+
+    #[test]
+    fn force_reload_active_editor_replaces_dirty_buffer_from_disk() {
+        let file_path = test_file_path("force-reload-active-dirty");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "old text").unwrap();
+
+        let path = ProjectPath::new(1, file_path.clone());
+        let mut workspace = Workspace::new();
+        workspace.open_editor_from_file(path.clone()).unwrap();
+        workspace
+            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('/')))
+            .unwrap();
+
+        std::fs::write(&file_path, "new text").unwrap();
+
+        let outcome = workspace
+            .dispatch_command(WorkspaceCommand::ForceReloadActiveEditor)
+            .unwrap();
+
+        assert_eq!(outcome.reloaded_path, Some(path));
+        assert!(outcome.reload_changed_text);
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "new text"
+        );
+        assert!(!workspace.project().has_dirty_buffers());
+        assert!(!workspace.rendered_workspace(None).tabs[0].has_external_change);
     }
 }

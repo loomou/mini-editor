@@ -76,6 +76,16 @@ impl Selection {
         let tail = self.tail();
         *self = Self::from_anchor_head(self.id, tail, head);
     }
+
+    fn clamp_to_text(&mut self, text: &str) {
+        self.start = floor_char_boundary(text, self.start);
+        self.end = floor_char_boundary(text, self.end);
+
+        if self.start == self.end {
+            self.reversed = false;
+            self.goal = SelectionGoal::None;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -269,6 +279,14 @@ impl EditorModel {
 
     pub fn redo(&mut self) -> Result<bool, String> {
         self.buffer.redo()
+    }
+
+    pub fn refresh_buffer_ranges(&mut self) {
+        self.buffer.refresh();
+        let text = self.snapshot().text().to_string();
+        for selection in &mut self.selections {
+            selection.clamp_to_text(&text);
+        }
     }
 }
 
@@ -485,5 +503,58 @@ mod tests {
         editor.insert_text("zed").unwrap();
 
         assert!(editor.is_dirty());
+    }
+
+    #[test]
+    fn refresh_buffer_ranges_tracks_external_buffer_length_changes() {
+        let buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            language::SourceFile::new("src/main.rs"),
+            "old",
+        )
+        .into_handle();
+        let mut editor = EditorModel::for_buffer("src/main.rs", buffer.clone());
+
+        buffer.borrow_mut().reload_saved_text("new longer text");
+        editor.refresh_buffer_ranges();
+
+        assert_eq!(editor.snapshot().text(), "new longer text");
+    }
+
+    #[test]
+    fn refresh_buffer_ranges_clamps_selection_after_external_shrink() {
+        let buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            language::SourceFile::new("src/main.rs"),
+            "hello world",
+        )
+        .into_handle();
+        let mut editor = EditorModel::for_buffer("src/main.rs", buffer.clone());
+        editor.select_anchor_head(11, 6);
+
+        buffer.borrow_mut().reload_saved_text("hello");
+        editor.refresh_buffer_ranges();
+
+        let selection = &editor.selections()[0];
+        assert_eq!(selection.range(), 5..5);
+        assert_eq!(selection.head(), 5);
+        assert!(!selection.reversed);
+    }
+
+    #[test]
+    fn refresh_buffer_ranges_clamps_to_utf8_boundary_after_external_shrink() {
+        let buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            language::SourceFile::new("src/main.rs"),
+            "aéz",
+        )
+        .into_handle();
+        let mut editor = EditorModel::for_buffer("src/main.rs", buffer.clone());
+        editor.select(4..4);
+
+        buffer.borrow_mut().reload_saved_text("aé");
+        editor.refresh_buffer_ranges();
+
+        assert_eq!(editor.cursor_offset().unwrap(), 3);
     }
 }
