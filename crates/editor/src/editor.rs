@@ -111,6 +111,7 @@ impl Selection {
 pub struct EditorModel {
     buffer: MultiBuffer,
     selections: Vec<Selection>,
+    active_selection_index: usize,
 }
 
 impl EditorModel {
@@ -122,6 +123,7 @@ impl EditorModel {
         Self {
             buffer,
             selections: vec![selection],
+            active_selection_index: 0,
         }
     }
 
@@ -149,6 +151,22 @@ impl EditorModel {
         &self.selections
     }
 
+    pub fn active_selection_index(&self) -> usize {
+        self.active_selection_index
+    }
+
+    pub fn set_active_selection_index(&mut self, index: usize) -> Result<(), String> {
+        if index >= self.selections.len() {
+            return Err(format!(
+                "active selection index {index} is out of range for {} selections",
+                self.selections.len()
+            ));
+        }
+
+        self.active_selection_index = index;
+        Ok(())
+    }
+
     pub fn resolved_selections(&self) -> Vec<Selection> {
         self.selections
             .iter()
@@ -157,23 +175,41 @@ impl EditorModel {
     }
 
     pub fn select(&mut self, range: Range<usize>) {
+        self.select_ranges(vec![range]);
+    }
+
+    pub fn select_ranges(&mut self, ranges: Vec<Range<usize>>) {
         let text = self.snapshot().text().to_string();
-        let start = floor_char_boundary(&text, range.start);
-        let end = floor_char_boundary(&text, range.end);
-        self.set_single_selection(Selection::from_anchor_head(
-            0,
-            start.min(end),
-            start.max(end),
-        ));
+        let selections = ranges
+            .into_iter()
+            .enumerate()
+            .map(|(id, range)| {
+                let start = floor_char_boundary(&text, range.start);
+                let end = floor_char_boundary(&text, range.end);
+                Selection::from_anchor_head(id, start.min(end), start.max(end))
+            })
+            .collect();
+        self.set_selections(normalize_new_selections(selections));
     }
 
     pub fn select_anchor_head(&mut self, anchor: usize, head: usize) {
+        self.select_anchor_heads(vec![(anchor, head)]);
+    }
+
+    pub fn select_anchor_heads(&mut self, anchor_heads: Vec<(usize, usize)>) {
         let text = self.snapshot().text().to_string();
-        self.set_single_selection(Selection::from_anchor_head(
-            0,
-            floor_char_boundary(&text, anchor),
-            floor_char_boundary(&text, head),
-        ));
+        let selections = anchor_heads
+            .into_iter()
+            .enumerate()
+            .map(|(id, (anchor, head))| {
+                Selection::from_anchor_head(
+                    id,
+                    floor_char_boundary(&text, anchor),
+                    floor_char_boundary(&text, head),
+                )
+            })
+            .collect();
+        self.set_selections(normalize_new_selections(selections));
     }
 
     pub fn cursor_offset(&self) -> Result<usize, String> {
@@ -194,7 +230,7 @@ impl EditorModel {
         let selection = self.active_selection()?;
 
         if !extend && !selection.is_empty() {
-            self.set_single_selection(Selection::caret(selection.start));
+            self.set_active_selection(Selection::caret(selection.start))?;
             return Ok(());
         }
 
@@ -207,7 +243,7 @@ impl EditorModel {
         let selection = self.active_selection()?;
 
         if !extend && !selection.is_empty() {
-            self.set_single_selection(Selection::caret(selection.end));
+            self.set_active_selection(Selection::caret(selection.end))?;
             return Ok(());
         }
 
@@ -223,16 +259,45 @@ impl EditorModel {
         } else {
             selection.collapse_to(target);
         }
-        self.set_single_selection(selection.clone());
+        self.set_active_selection(selection)?;
         Ok(())
     }
 
     pub fn insert_text(&mut self, text: impl Into<String>) -> Result<(), String> {
-        let selection = self.active_selection()?;
         let replacement = text.into();
-        let cursor = selection.start + replacement.len();
-        self.buffer.edit(selection.range(), replacement)?;
-        self.set_single_selection(Selection::caret(cursor));
+        let selections = self.resolved_selections();
+        let sorted_selections = sorted_non_overlapping_selections(selections.clone())?;
+        let replacement_len = isize::try_from(replacement.len())
+            .map_err(|_| "replacement text is too large".to_string())?;
+        let mut next_selections = selections;
+        let mut delta = 0isize;
+
+        for (selection_index, selection) in &sorted_selections {
+            let start = selection
+                .start
+                .checked_add_signed(delta)
+                .ok_or_else(|| "selection offset overflowed while inserting text".to_string())?;
+            let cursor = start
+                .checked_add(replacement.len())
+                .ok_or_else(|| "cursor offset overflowed while inserting text".to_string())?;
+            let mut caret = Selection::caret(cursor);
+            caret.id = selection.id;
+            next_selections[*selection_index] = caret;
+
+            let range_len = isize::try_from(selection.range().len())
+                .map_err(|_| "selection range is too large".to_string())?;
+            delta = delta
+                .checked_add(replacement_len - range_len)
+                .ok_or_else(|| {
+                    "selection offset delta overflowed while inserting text".to_string()
+                })?;
+        }
+
+        for (_, selection) in sorted_selections.iter().rev() {
+            self.buffer.edit(selection.range(), replacement.clone())?;
+        }
+
+        self.set_selections_with_active_index(next_selections, self.active_selection_index);
         Ok(())
     }
 
@@ -241,39 +306,49 @@ impl EditorModel {
     }
 
     pub fn backspace(&mut self) -> Result<bool, String> {
-        let selection = self.active_selection()?;
-
-        if !selection.is_empty() {
-            return self.delete_range(selection.range());
-        }
-
         let text = self.snapshot().text().to_string();
-        let cursor = floor_char_boundary(&text, selection.head());
-        let start = previous_char_boundary(&text, cursor);
-        self.delete_range(start..cursor)
+        let edit_ranges = self
+            .resolved_selections()
+            .into_iter()
+            .enumerate()
+            .map(|(selection_index, selection)| {
+                let range = if selection.is_empty() {
+                    let cursor = floor_char_boundary(&text, selection.head());
+                    previous_char_boundary(&text, cursor)..cursor
+                } else {
+                    selection.range()
+                };
+                SelectionEditRange {
+                    selection_index,
+                    selection,
+                    range,
+                }
+            })
+            .collect();
+        self.delete_selection_ranges(edit_ranges)
     }
 
     pub fn delete(&mut self) -> Result<bool, String> {
-        let selection = self.active_selection()?;
-
-        if !selection.is_empty() {
-            return self.delete_range(selection.range());
-        }
-
         let text = self.snapshot().text().to_string();
-        let cursor = floor_char_boundary(&text, selection.head());
-        let end = next_char_boundary(&text, cursor);
-        self.delete_range(cursor..end)
-    }
-
-    fn delete_range(&mut self, range: Range<usize>) -> Result<bool, String> {
-        if range.start == range.end {
-            return Ok(false);
-        }
-
-        self.buffer.edit(range.clone(), "")?;
-        self.set_single_selection(Selection::caret(range.start));
-        Ok(true)
+        let edit_ranges = self
+            .resolved_selections()
+            .into_iter()
+            .enumerate()
+            .map(|(selection_index, selection)| {
+                let range = if selection.is_empty() {
+                    let cursor = floor_char_boundary(&text, selection.head());
+                    cursor..next_char_boundary(&text, cursor)
+                } else {
+                    selection.range()
+                };
+                SelectionEditRange {
+                    selection_index,
+                    selection,
+                    range,
+                }
+            })
+            .collect();
+        self.delete_selection_ranges(edit_ranges)
     }
 
     pub fn undo(&mut self) -> Result<bool, String> {
@@ -292,6 +367,53 @@ impl EditorModel {
         Ok(changed)
     }
 
+    fn delete_selection_ranges(
+        &mut self,
+        edit_ranges: Vec<SelectionEditRange>,
+    ) -> Result<bool, String> {
+        if !edit_ranges
+            .iter()
+            .any(|edit_range| !edit_range.range.is_empty())
+        {
+            return Ok(false);
+        }
+
+        let sorted_edit_ranges = sorted_non_overlapping_edit_ranges(edit_ranges.clone())?;
+        let mut next_selections = edit_ranges
+            .into_iter()
+            .map(|edit_range| edit_range.selection)
+            .collect::<Vec<_>>();
+        let mut delta = 0isize;
+
+        for edit_range in &sorted_edit_ranges {
+            let cursor = edit_range
+                .range
+                .start
+                .checked_add_signed(delta)
+                .ok_or_else(|| "selection offset overflowed while deleting text".to_string())?;
+            let mut caret = Selection::caret(cursor);
+            caret.id = edit_range.selection.id;
+            next_selections[edit_range.selection_index] = caret;
+
+            let range_len = isize::try_from(edit_range.range.len())
+                .map_err(|_| "selection range is too large".to_string())?;
+            delta = delta.checked_sub(range_len).ok_or_else(|| {
+                "selection offset delta overflowed while deleting text".to_string()
+            })?;
+        }
+
+        for edit_range in sorted_edit_ranges
+            .iter()
+            .rev()
+            .filter(|edit_range| !edit_range.range.is_empty())
+        {
+            self.buffer.edit(edit_range.range.clone(), "")?;
+        }
+
+        self.set_selections_with_active_index(next_selections, self.active_selection_index);
+        Ok(true)
+    }
+
     pub fn refresh_buffer_ranges(&mut self) {
         self.buffer.refresh();
         let text = self.snapshot().text().to_string();
@@ -301,14 +423,41 @@ impl EditorModel {
         self.reattach_selection_anchors();
     }
 
-    fn set_single_selection(&mut self, mut selection: Selection) {
+    fn set_selections(&mut self, selections: Vec<Selection>) {
+        let active_selection_index = selections.len().saturating_sub(1);
+        self.set_selections_with_active_index(selections, active_selection_index);
+    }
+
+    fn set_selections_with_active_index(
+        &mut self,
+        mut selections: Vec<Selection>,
+        active_selection_index: usize,
+    ) {
+        if selections.is_empty() {
+            selections.push(Selection::caret(0));
+        }
+
+        for selection in &mut selections {
+            attach_selection_anchors(&mut self.buffer, selection);
+        }
+        self.active_selection_index = active_selection_index.min(selections.len() - 1);
+        self.selections = selections;
+    }
+
+    fn set_active_selection(&mut self, mut selection: Selection) -> Result<(), String> {
+        let active_selection = self
+            .selections
+            .get(self.active_selection_index)
+            .ok_or_else(|| "editor has no active selection".to_string())?;
+        selection.id = active_selection.id;
         attach_selection_anchors(&mut self.buffer, &mut selection);
-        self.selections = vec![selection];
+        self.selections[self.active_selection_index] = selection;
+        Ok(())
     }
 
     fn active_selection(&self) -> Result<Selection, String> {
         self.selections
-            .first()
+            .get(self.active_selection_index)
             .map(|selection| resolve_selection_from_anchors(&self.buffer, selection))
             .ok_or_else(|| "editor has no active selection".to_string())
     }
@@ -326,6 +475,87 @@ impl EditorModel {
             attach_selection_anchors(buffer, selection);
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct SelectionEditRange {
+    selection_index: usize,
+    selection: Selection,
+    range: Range<usize>,
+}
+
+fn normalize_new_selections(mut selections: Vec<Selection>) -> Vec<Selection> {
+    selections.sort_by_key(|selection| (selection.start, selection.end));
+
+    let mut normalized: Vec<Selection> = Vec::new();
+    for selection in selections {
+        let Some(last) = normalized.last_mut() else {
+            normalized.push(selection);
+            continue;
+        };
+
+        if selections_overlap_or_duplicate(last, &selection) {
+            let start = last.start.min(selection.start);
+            let end = last.end.max(selection.end);
+            *last = Selection::from_anchor_head(last.id, start, end);
+        } else {
+            normalized.push(selection);
+        }
+    }
+
+    for (id, selection) in normalized.iter_mut().enumerate() {
+        selection.id = id;
+    }
+
+    normalized
+}
+
+fn selections_overlap_or_duplicate(left: &Selection, right: &Selection) -> bool {
+    if left.is_empty() && right.is_empty() {
+        return left.start == right.start;
+    }
+
+    left.start < right.end && right.start < left.end
+}
+
+fn sorted_non_overlapping_selections(
+    selections: Vec<Selection>,
+) -> Result<Vec<(usize, Selection)>, String> {
+    let mut sorted_selections = selections.into_iter().enumerate().collect::<Vec<_>>();
+    sorted_selections.sort_by_key(|(_, selection)| (selection.start, selection.end));
+
+    for window in sorted_selections.windows(2) {
+        let previous = &window[0].1;
+        let current = &window[1].1;
+        if previous.end > current.start {
+            return Err(format!(
+                "selection {} overlaps selection {}",
+                previous.id, current.id
+            ));
+        }
+    }
+
+    Ok(sorted_selections)
+}
+
+fn sorted_non_overlapping_edit_ranges(
+    edit_ranges: Vec<SelectionEditRange>,
+) -> Result<Vec<SelectionEditRange>, String> {
+    let mut sorted_edit_ranges = edit_ranges;
+    sorted_edit_ranges.sort_by_key(|edit_range| (edit_range.range.start, edit_range.range.end));
+
+    for window in sorted_edit_ranges.windows(2) {
+        let previous = &window[0];
+        let current = &window[1];
+        if previous.range.end > current.range.start {
+            return Err(format!(
+                "selection {} overlaps selection {}",
+                previous.selection.id, current.selection.id
+            ));
+        }
+    }
+
+    Ok(sorted_edit_ranges)
 }
 
 fn resolve_selection_from_anchors(buffer: &MultiBuffer, selection: &Selection) -> Selection {
@@ -499,6 +729,126 @@ mod tests {
     }
 
     #[test]
+    fn select_ranges_tracks_multiple_selections_independently() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        assert_eq!(
+            editor
+                .selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 8..13]
+        );
+
+        editor.buffer.edit(4..4, "big ").unwrap();
+
+        let resolved = editor.resolved_selections();
+        assert_eq!(
+            resolved.iter().map(Selection::range).collect::<Vec<_>>(),
+            vec![0..3, 12..17]
+        );
+
+        editor.sync_selections_to_anchors();
+        assert_eq!(
+            editor
+                .selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 12..17]
+        );
+    }
+
+    #[test]
+    fn select_anchor_heads_preserves_multiple_selection_directions() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_anchor_heads(vec![(3, 0), (4, 7)]);
+
+        let selections = editor.selections();
+        assert_eq!(selections.len(), 2);
+        assert_eq!(selections[0].range(), 0..3);
+        assert_eq!(selections[0].head(), 0);
+        assert_eq!(selections[0].tail(), 3);
+        assert!(selections[0].reversed);
+        assert_eq!(selections[1].range(), 4..7);
+        assert_eq!(selections[1].head(), 7);
+        assert_eq!(selections[1].tail(), 4);
+        assert!(!selections[1].reversed);
+    }
+
+    #[test]
+    fn select_ranges_normalizes_overlapping_and_duplicate_selections() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdefghi");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![2..5, 0..3, 7..7, 7..7]);
+
+        assert_eq!(
+            editor
+                .selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..5, 7..7]
+        );
+        assert_eq!(editor.active_selection_index(), 1);
+    }
+
+    #[test]
+    fn select_anchor_heads_normalizes_overlaps_to_forward_selection() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdefghi");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_anchor_heads(vec![(5, 1), (3, 8)]);
+
+        let selections = editor.selections();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].range(), 1..8);
+        assert_eq!(selections[0].head(), 8);
+        assert_eq!(selections[0].tail(), 1);
+        assert!(!selections[0].reversed);
+    }
+
+    #[test]
+    fn active_selection_index_controls_cursor_queries() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        assert_eq!(editor.active_selection_index(), 1);
+        assert_eq!(editor.cursor_offset().unwrap(), 13);
+
+        editor.set_active_selection_index(0).unwrap();
+
+        assert_eq!(editor.active_selection_index(), 0);
+        assert_eq!(editor.cursor_offset().unwrap(), 3);
+        assert!(editor.set_active_selection_index(2).is_err());
+        assert_eq!(editor.active_selection_index(), 0);
+    }
+
+    #[test]
+    fn movement_updates_active_selection_without_dropping_other_selections() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        editor.set_active_selection_index(0).unwrap();
+        editor.move_right(false).unwrap();
+
+        assert_eq!(editor.active_selection_index(), 0);
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![3..3, 8..13]
+        );
+    }
+
+    #[test]
     fn movement_collapses_or_extends_selection() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
         let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
@@ -630,6 +980,101 @@ mod tests {
 
         assert_eq!(editor.snapshot().text(), "say hello zed");
         assert_eq!(editor.cursor_offset().unwrap(), 13);
+    }
+
+    #[test]
+    fn insertion_replaces_all_non_overlapping_selections() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        editor.insert_text("x").unwrap();
+
+        assert_eq!(editor.snapshot().text(), "x two x");
+        assert_eq!(editor.active_selection_index(), 1);
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![1..1, 7..7]
+        );
+        assert_eq!(editor.cursor_offset().unwrap(), 7);
+    }
+
+    #[test]
+    fn insertion_rejects_overlapping_selections() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.selections = vec![
+            Selection::from_anchor_head(0, 1, 4),
+            Selection::from_anchor_head(1, 3, 5),
+        ];
+        editor.active_selection_index = 1;
+        editor.reattach_selection_anchors();
+
+        let error = editor.insert_text("x").unwrap_err();
+
+        assert!(error.contains("overlaps"));
+        assert_eq!(editor.snapshot().text(), "abcdef");
+    }
+
+    #[test]
+    fn delete_removes_all_non_overlapping_selection_ranges() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        assert!(editor.delete().unwrap());
+
+        assert_eq!(editor.snapshot().text(), " two ");
+        assert_eq!(editor.active_selection_index(), 1);
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..0, 5..5]
+        );
+        assert_eq!(editor.cursor_offset().unwrap(), 5);
+    }
+
+    #[test]
+    fn backspace_removes_previous_character_for_all_carets() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![1..1, 3..3]);
+
+        assert!(editor.backspace().unwrap());
+
+        assert_eq!(editor.snapshot().text(), "bd");
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..0, 1..1]
+        );
+    }
+
+    #[test]
+    fn deletion_rejects_overlapping_selection_ranges() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.selections = vec![
+            Selection::from_anchor_head(0, 1, 4),
+            Selection::from_anchor_head(1, 3, 5),
+        ];
+        editor.active_selection_index = 1;
+        editor.reattach_selection_anchors();
+
+        let error = editor.delete().unwrap_err();
+
+        assert!(error.contains("overlaps"));
+        assert_eq!(editor.snapshot().text(), "abcdef");
     }
 
     #[test]
