@@ -126,6 +126,20 @@ impl Buffer {
         Ok(())
     }
 
+    pub fn undo(&mut self) -> Result<bool, String> {
+        if !self.capability.editable() {
+            return Err("buffer is read-only".to_string());
+        }
+        Ok(self.text.undo())
+    }
+
+    pub fn redo(&mut self) -> Result<bool, String> {
+        if !self.capability.editable() {
+            return Err("buffer is read-only".to_string());
+        }
+        Ok(self.text.redo())
+    }
+
     pub fn save(&mut self) {
         self.saved_version = self.text.snapshot().version();
     }
@@ -154,5 +168,23 @@ mod tests {
 
         buffer.save();
         assert!(!buffer.snapshot().is_dirty());
+    }
+
+    #[test]
+    fn undo_keeps_dirty_state_relative_to_saved_version() {
+        let mut buffer = Buffer::local(BufferId::new(1).unwrap(), "hello");
+        buffer.save();
+
+        buffer
+            .edit(TextEdit {
+                range: 5..5,
+                replacement: " zed".to_string(),
+            })
+            .unwrap();
+        assert!(buffer.snapshot().is_dirty());
+
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.snapshot().text.text(), "hello");
+        assert!(buffer.snapshot().is_dirty());
     }
 }

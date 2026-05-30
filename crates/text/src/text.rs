@@ -62,10 +62,16 @@ impl BufferSnapshot {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextEdit {
     pub range: Range<usize>,
     pub replacement: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryEntry {
+    undo: TextEdit,
+    redo: TextEdit,
 }
 
 #[derive(Debug)]
@@ -74,6 +80,8 @@ pub struct Buffer {
     text: Rope,
     version: u64,
     anchors: Vec<Anchor>,
+    undo_stack: Vec<HistoryEntry>,
+    redo_stack: Vec<HistoryEntry>,
 }
 
 impl Buffer {
@@ -83,6 +91,8 @@ impl Buffer {
             text: Rope::new(text.into()),
             version: 0,
             anchors: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -108,6 +118,47 @@ impl Buffer {
     }
 
     pub fn edit(&mut self, edit: TextEdit) {
+        let deleted_text = self.text.slice(edit.range.clone());
+        let undo_range = edit.range.start..edit.range.start + edit.replacement.len();
+        let history_entry = HistoryEntry {
+            undo: TextEdit {
+                range: undo_range,
+                replacement: deleted_text,
+            },
+            redo: edit.clone(),
+        };
+        self.apply_edit(edit);
+        self.undo_stack.push(history_entry);
+        self.redo_stack.clear();
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(history_entry) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.apply_edit(history_entry.undo.clone());
+        self.redo_stack.push(history_entry);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(history_entry) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.apply_edit(history_entry.redo.clone());
+        self.undo_stack.push(history_entry);
+        true
+    }
+
+    fn apply_edit(&mut self, edit: TextEdit) {
         assert!(edit.range.start <= edit.range.end, "edit range is reversed");
         assert!(
             edit.range.end <= self.text.len(),
@@ -149,5 +200,23 @@ mod tests {
 
         assert_eq!(snapshot.point_for_offset(3), Point { row: 1, column: 1 });
         assert_eq!(snapshot.offset_for_point(Point { row: 1, column: 2 }), 4);
+    }
+
+    #[test]
+    fn undo_and_redo_reapply_text_edits() {
+        let mut buffer = Buffer::new(BufferId::new(1).unwrap(), "hello world");
+
+        buffer.edit(TextEdit {
+            range: 6..11,
+            replacement: "zed".to_string(),
+        });
+
+        assert_eq!(buffer.snapshot().text(), "hello zed");
+        assert!(buffer.can_undo());
+        assert!(buffer.undo());
+        assert_eq!(buffer.snapshot().text(), "hello world");
+        assert!(buffer.can_redo());
+        assert!(buffer.redo());
+        assert_eq!(buffer.snapshot().text(), "hello zed");
     }
 }

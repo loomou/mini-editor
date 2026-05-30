@@ -52,6 +52,14 @@ impl EditorModel {
         }];
         Ok(())
     }
+
+    pub fn undo(&mut self) -> Result<bool, String> {
+        self.buffer.undo()
+    }
+
+    pub fn redo(&mut self) -> Result<bool, String> {
+        self.buffer.redo()
+    }
 }
 
 #[cfg(test)]
@@ -81,5 +89,21 @@ mod tests {
 
         assert_eq!(display.rows()[0].text, "abc");
         assert_eq!(display.rows()[1].text, "def");
+    }
+
+    #[test]
+    fn undo_and_redo_flow_through_editor_model() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(6..11);
+        editor.insert_text("zed").unwrap();
+        assert_eq!(editor.snapshot().text(), "hello zed");
+
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.snapshot().text(), "hello world");
+
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.snapshot().text(), "hello zed");
     }
 }

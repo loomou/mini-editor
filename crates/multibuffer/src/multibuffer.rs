@@ -191,6 +191,56 @@ impl MultiBuffer {
 
         Ok(())
     }
+
+    pub fn undo(&mut self) -> Result<bool, String> {
+        if !self.capability.editable() {
+            return Err("multibuffer is read-only".to_string());
+        }
+        let (buffer_id, buffer) = self.singleton_buffer()?;
+        let changed = buffer.borrow_mut().undo()?;
+        if changed {
+            self.refresh_singleton_excerpt(buffer_id);
+        }
+        Ok(changed)
+    }
+
+    pub fn redo(&mut self) -> Result<bool, String> {
+        if !self.capability.editable() {
+            return Err("multibuffer is read-only".to_string());
+        }
+        let (buffer_id, buffer) = self.singleton_buffer()?;
+        let changed = buffer.borrow_mut().redo()?;
+        if changed {
+            self.refresh_singleton_excerpt(buffer_id);
+        }
+        Ok(changed)
+    }
+
+    fn singleton_buffer(&self) -> Result<(BufferId, BufferHandle), String> {
+        if self.buffers.len() != 1 || self.excerpts.len() != 1 {
+            return Err("this teaching step only supports singleton undo/redo".to_string());
+        }
+        let (buffer_id, buffer) = self
+            .buffers
+            .iter()
+            .next()
+            .ok_or_else(|| "multibuffer has no buffers".to_string())?;
+        Ok((*buffer_id, buffer.clone()))
+    }
+
+    fn refresh_singleton_excerpt(&mut self, buffer_id: BufferId) {
+        let Some(excerpt) = self.excerpts.first_mut() else {
+            return;
+        };
+        if excerpt.buffer_id != buffer_id {
+            return;
+        }
+        let Some(buffer) = self.buffers.get(&buffer_id) else {
+            return;
+        };
+        let len = buffer.borrow().snapshot().text.len();
+        excerpt.range = ExcerptRange::new(0..len);
+    }
 }
 
 #[cfg(test)]
@@ -217,6 +267,21 @@ mod tests {
 
         multibuffer.edit(6..11, "zed").unwrap();
 
+        assert_eq!(multibuffer.snapshot().text(), "hello zed");
+    }
+
+    #[test]
+    fn undo_and_redo_route_to_singleton_buffer() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let mut multibuffer = MultiBuffer::singleton("scratch", buffer.into_handle());
+
+        multibuffer.edit(6..11, "zed").unwrap();
+        assert_eq!(multibuffer.snapshot().text(), "hello zed");
+
+        assert!(multibuffer.undo().unwrap());
+        assert_eq!(multibuffer.snapshot().text(), "hello world");
+
+        assert!(multibuffer.redo().unwrap());
         assert_eq!(multibuffer.snapshot().text(), "hello zed");
     }
 }
