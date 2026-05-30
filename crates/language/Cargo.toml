@@ -1,0 +1,12 @@
+[package]
+name = "language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/language.rs"
+doctest = false
+
+[dependencies]
+text.workspace = true

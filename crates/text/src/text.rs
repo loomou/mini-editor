@@ -1,6 +1,7 @@
 mod anchor;
 
-use anchor::{Anchor, Bias, BufferId, Point};
+pub use anchor::BufferId;
+use anchor::{Anchor, Bias, Point};
 use std::ops::Range;
 
 #[derive(Clone, Debug)]

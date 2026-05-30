@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/language",
     "crates/text",
     "crates/rope"
 ]
@@ -10,3 +11,8 @@ name = "mini-editor"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+
+[workspace.dependencies]
+language = { path = "crates/ language" }
+rope = { path = "crates/rope" }
+text = { path = "crates/text" }
