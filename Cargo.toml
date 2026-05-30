@@ -3,6 +3,7 @@ members = [
     "crates/editor",
     "crates/language",
     "crates/multibuffer",
+    "crates/project",
     "crates/text",
     "crates/rope"
 ]
@@ -18,5 +19,6 @@ license = "MIT"
 editor = { path = "crates/editor" }
 language = { path = "crates/language" }
 multibuffer = { path = "crates/multibuffer" }
+project = { path = "crates/project" }
 rope = { path = "crates/rope" }
 text = { path = "crates/text" }

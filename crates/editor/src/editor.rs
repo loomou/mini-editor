@@ -1,4 +1,4 @@
-use language::Buffer;
+use language::BufferHandle;
 use multibuffer::{MultiBuffer, MultiBufferSnapshot};
 use std::ops::Range;
 
@@ -14,7 +14,7 @@ pub struct EditorModel {
 }
 
 impl EditorModel {
-    pub fn for_buffer(path_key: impl Into<String>, buffer: Buffer) -> Self {
+    pub fn for_buffer(path_key: impl Into<String>, buffer: BufferHandle) -> Self {
         Self {
             buffer: MultiBuffer::singleton(path_key, buffer),
             selections: vec![Selection { range: 0..0 }],
@@ -52,12 +52,13 @@ impl EditorModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use language::Buffer;
     use text::BufferId;
 
     #[test]
     fn insertion_replaces_active_selection() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
-        let mut editor = EditorModel::for_buffer("scratch", buffer);
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
 
         editor.select(6..11);
         editor.insert_text("zed").unwrap();

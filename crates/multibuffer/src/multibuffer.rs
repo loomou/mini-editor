@@ -1,4 +1,4 @@
-use language::{Buffer, BufferSnapshot, Capability};
+use language::{BufferHandle, BufferSnapshot, Capability};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use text::{BufferId, TextEdit};
@@ -71,7 +71,7 @@ impl MultiBufferSnapshot {
 
 #[derive(Debug)]
 pub struct MultiBuffer {
-    buffers: BTreeMap<BufferId, Buffer>,
+    buffers: BTreeMap<BufferId, BufferHandle>,
     excerpts: Vec<Excerpt>,
     capability: Capability,
 }
@@ -85,8 +85,8 @@ impl MultiBuffer {
         }
     }
 
-    pub fn singleton(path_key: impl Into<String>, buffer: Buffer) -> Self {
-        let snapshot = buffer.snapshot();
+    pub fn singleton(path_key: impl Into<String>, buffer: BufferHandle) -> Self {
+        let snapshot = buffer.borrow().snapshot();
         let len = snapshot.text.len();
         let mut multibuffer = Self::new(snapshot.capability);
         multibuffer.add_excerpt(path_key, buffer, ExcerptRange::new(0..len));
@@ -96,10 +96,10 @@ impl MultiBuffer {
     pub fn add_excerpt(
         &mut self,
         path_key: impl Into<String>,
-        buffer: Buffer,
+        buffer: BufferHandle,
         range: ExcerptRange,
     ) {
-        let buffer_id = buffer.id();
+        let buffer_id = buffer.borrow().id();
         self.buffers.insert(buffer_id, buffer);
         self.excerpts.push(Excerpt {
             path_key: path_key.into(),
@@ -112,7 +112,7 @@ impl MultiBuffer {
         let buffers = self
             .buffers
             .iter()
-            .map(|(id, buffer)| (*id, buffer.snapshot()))
+            .map(|(id, buffer)| (*id, buffer.borrow().snapshot()))
             .collect::<BTreeMap<_, _>>();
         let text = self
             .excerpts
@@ -160,7 +160,7 @@ impl MultiBuffer {
             .buffers
             .get_mut(&start.0)
             .ok_or_else(|| "buffer disappeared".to_string())?;
-        buffer.edit(TextEdit {
+        buffer.borrow_mut().edit(TextEdit {
             range: start.1..end.1,
             replacement,
         })?;
@@ -196,7 +196,7 @@ impl MultiBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use language::SourceFile;
+    use language::{Buffer, SourceFile};
 
     #[test]
     fn singleton_exposes_buffer_text() {
@@ -205,7 +205,7 @@ mod tests {
             SourceFile::new("src/main.rs"),
             "fn main() {}",
         );
-        let multibuffer = MultiBuffer::singleton("src/main.rs", buffer);
+        let multibuffer = MultiBuffer::singleton("src/main.rs", buffer.into_handle());
 
         assert_eq!(multibuffer.snapshot().text(), "fn main() {}");
     }
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn edits_route_back_to_underlying_buffer() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
-        let mut multibuffer = MultiBuffer::singleton("scratch", buffer);
+        let mut multibuffer = MultiBuffer::singleton("scratch", buffer.into_handle());
 
         multibuffer.edit(6..11, "zed").unwrap();
 

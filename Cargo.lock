@@ -27,6 +27,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "project"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "language",
+ "text",
+]
+
+[[package]]
 name = "rope"
 version = "0.1.0"
 

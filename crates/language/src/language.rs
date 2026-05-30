@@ -1,5 +1,9 @@
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use text::{Buffer as TextBuffer, BufferId, BufferSnapshot as TextSnapshot, TextEdit};
+
+pub type BufferHandle = Rc<RefCell<Buffer>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
@@ -81,6 +85,10 @@ impl Buffer {
             file: Some(file),
             ..Self::local(id, text)
         }
+    }
+
+    pub fn into_handle(self) -> BufferHandle {
+        Rc::new(RefCell::new(self))
     }
 
     pub fn id(&self) -> BufferId {
