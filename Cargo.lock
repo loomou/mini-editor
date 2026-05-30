@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "multibuffer"
+version = "0.1.0"
+dependencies = [
+ "language",
+ "text",
+]
+
+[[package]]
 name = "rope"
 version = "0.1.0"
 

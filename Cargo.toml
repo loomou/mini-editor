@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/language",
+    "crates/multibuffer",
     "crates/text",
     "crates/rope"
 ]
@@ -13,6 +14,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-language = { path = "crates/ language" }
+language = { path = "crates/language" }
+minibuffer = { path = "crates/multibuffer" }
 rope = { path = "crates/rope" }
 text = { path = "crates/text" }
