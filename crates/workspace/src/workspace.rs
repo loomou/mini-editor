@@ -15,10 +15,39 @@ pub struct WorkspaceCommandOutcome {
     pub saved_paths: Vec<ProjectPath>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedWorkspace {
+    pub tabs: Vec<RenderedTab>,
+    pub active_editor: Option<RenderedEditor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedTab {
+    pub path: ProjectPath,
+    pub title: String,
+    pub is_active: bool,
+    pub is_dirty: bool,
+}
+
+impl RenderedTab {
+    pub fn label_text(&self) -> String {
+        let active_marker = if self.is_active { '>' } else { ' ' };
+        let dirty_marker = if self.is_dirty { '*' } else { ' ' };
+        format!("{active_marker}{dirty_marker} {}", self.title)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Workspace {
     project: Project,
-    active_editor: Option<EditorView>,
+    open_editors: Vec<WorkspaceEditor>,
+    active_index: Option<usize>,
+}
+
+#[derive(Debug)]
+struct WorkspaceEditor {
+    path: ProjectPath,
+    view: EditorView,
 }
 
 impl Workspace {
@@ -27,16 +56,32 @@ impl Workspace {
     }
 
     pub fn open_editor(&mut self, path: ProjectPath, text: impl Into<String>) {
-        let editor = self.project.open_editor(path, text);
-        self.active_editor = Some(EditorView::new(editor));
+        if self.activate_existing_editor(&path) {
+            return;
+        }
+
+        let editor = self.project.open_editor(path.clone(), text);
+        self.open_editors.push(WorkspaceEditor {
+            path,
+            view: EditorView::new(editor),
+        });
+        self.active_index = Some(self.open_editors.len() - 1);
     }
 
     pub fn open_editor_from_file(&mut self, path: ProjectPath) -> Result<(), String> {
+        if self.activate_existing_editor(&path) {
+            return Ok(());
+        }
+
         let editor = self
             .project
-            .open_editor_from_file(path)
+            .open_editor_from_file(path.clone())
             .map_err(|error| error.to_string())?;
-        self.active_editor = Some(EditorView::new(editor));
+        self.open_editors.push(WorkspaceEditor {
+            path,
+            view: EditorView::new(editor),
+        });
+        self.active_index = Some(self.open_editors.len() - 1);
         Ok(())
     }
 
@@ -46,10 +91,7 @@ impl Workspace {
     ) -> Result<WorkspaceCommandOutcome, String> {
         match command {
             WorkspaceCommand::Editor(command) => {
-                let editor = self
-                    .active_editor
-                    .as_mut()
-                    .ok_or_else(|| "workspace has no active editor".to_string())?;
+                let editor = self.active_editor_mut()?;
                 Ok(WorkspaceCommandOutcome {
                     editor: Some(editor.dispatch_command(command)?),
                     saved_paths: Vec::new(),
@@ -69,13 +111,81 @@ impl Workspace {
         &self,
         soft_wrap_column: Option<usize>,
     ) -> Option<RenderedEditor> {
-        self.active_editor
+        self.active_editor()
             .as_ref()
             .map(|editor| editor.rendered_editor(soft_wrap_column))
     }
 
+    pub fn rendered_workspace(&self, soft_wrap_column: Option<usize>) -> RenderedWorkspace {
+        RenderedWorkspace {
+            tabs: self
+                .open_editors
+                .iter()
+                .enumerate()
+                .map(|(index, editor)| {
+                    let rendered = editor.view.rendered_editor(None);
+                    RenderedTab {
+                        path: editor.path.clone(),
+                        title: rendered.title,
+                        is_active: self.active_index == Some(index),
+                        is_dirty: rendered.is_dirty,
+                    }
+                })
+                .collect(),
+            active_editor: self.active_rendered_editor(soft_wrap_column),
+        }
+    }
+
+    pub fn open_paths(&self) -> Vec<ProjectPath> {
+        self.open_editors
+            .iter()
+            .map(|editor| editor.path.clone())
+            .collect()
+    }
+
+    pub fn active_path(&self) -> Option<&ProjectPath> {
+        self.active_index
+            .and_then(|index| self.open_editors.get(index))
+            .map(|editor| &editor.path)
+    }
+
+    pub fn switch_to_editor(&mut self, path: &ProjectPath) -> Result<(), String> {
+        self.activate_existing_editor(path)
+            .then_some(())
+            .ok_or_else(|| format!("workspace has no open editor for {}", path.path.display()))
+    }
+
     pub fn project(&self) -> &Project {
         &self.project
+    }
+
+    fn activate_existing_editor(&mut self, path: &ProjectPath) -> bool {
+        if let Some(index) = self
+            .open_editors
+            .iter()
+            .position(|editor| editor.path == *path)
+        {
+            self.active_index = Some(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn active_editor(&self) -> Option<&EditorView> {
+        self.active_index
+            .and_then(|index| self.open_editors.get(index))
+            .map(|editor| &editor.view)
+    }
+
+    fn active_editor_mut(&mut self) -> Result<&mut EditorView, String> {
+        let index = self
+            .active_index
+            .ok_or_else(|| "workspace has no active editor".to_string())?;
+        self.open_editors
+            .get_mut(index)
+            .map(|editor| &mut editor.view)
+            .ok_or_else(|| "workspace active editor is missing".to_string())
     }
 }
 
@@ -154,5 +264,81 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "workspace has no active editor");
+    }
+
+    #[test]
+    fn workspace_tracks_open_editors_and_switches_the_active_editor() {
+        let first = ProjectPath::new(1, "src/first.rs");
+        let second = ProjectPath::new(1, "src/second.rs");
+        let mut workspace = Workspace::new();
+
+        workspace.open_editor(first.clone(), "first");
+        workspace
+            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('/')))
+            .unwrap();
+
+        workspace.open_editor(second.clone(), "second");
+        workspace
+            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('*')))
+            .unwrap();
+
+        assert_eq!(workspace.open_paths(), vec![first.clone(), second.clone()]);
+        assert_eq!(workspace.active_path(), Some(&second));
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "*second"
+        );
+
+        workspace.switch_to_editor(&first).unwrap();
+
+        assert_eq!(workspace.active_path(), Some(&first));
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "/first"
+        );
+    }
+
+    #[test]
+    fn opening_an_already_open_path_switches_to_that_editor() {
+        let first = ProjectPath::new(1, "src/first.rs");
+        let second = ProjectPath::new(1, "src/second.rs");
+        let mut workspace = Workspace::new();
+
+        workspace.open_editor(first.clone(), "first");
+        workspace
+            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('/')))
+            .unwrap();
+        workspace.open_editor(second.clone(), "second");
+
+        workspace.open_editor(first.clone(), "ignored replacement");
+
+        assert_eq!(workspace.open_paths(), vec![first.clone(), second]);
+        assert_eq!(workspace.active_path(), Some(&first));
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "/first"
+        );
+    }
+
+    #[test]
+    fn rendered_workspace_lists_tabs_with_active_and_dirty_state() {
+        let first = ProjectPath::new(1, "src/first.rs");
+        let second = ProjectPath::new(1, "src/second.rs");
+        let mut workspace = Workspace::new();
+
+        workspace.open_editor(first.clone(), "first");
+        workspace
+            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('/')))
+            .unwrap();
+        workspace.open_editor(second.clone(), "second");
+
+        let rendered = workspace.rendered_workspace(None);
+
+        assert_eq!(rendered.tabs.len(), 2);
+        assert_eq!(rendered.tabs[0].path, first);
+        assert_eq!(rendered.tabs[0].label_text(), " * src/first.rs");
+        assert_eq!(rendered.tabs[1].path, second);
+        assert_eq!(rendered.tabs[1].label_text(), ">  src/second.rs");
+        assert_eq!(rendered.active_editor.unwrap().title, "src/second.rs");
     }
 }
