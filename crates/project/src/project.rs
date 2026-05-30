@@ -77,11 +77,37 @@ impl BufferStore {
         Ok(())
     }
 
+    pub fn save_dirty_buffers(&mut self) -> io::Result<Vec<ProjectPath>> {
+        let dirty_paths = self.dirty_paths();
+        for path in &dirty_paths {
+            self.save_buffer(path)?;
+        }
+        Ok(dirty_paths)
+    }
+
     pub fn buffer_for_path(&self, path: &ProjectPath) -> Option<BufferHandle> {
         self.path_to_buffer_id
             .get(path)
             .and_then(|buffer_id| self.buffers.get(buffer_id))
             .cloned()
+    }
+
+    pub fn dirty_paths(&self) -> Vec<ProjectPath> {
+        self.path_to_buffer_id
+            .iter()
+            .filter_map(|(path, buffer_id)| {
+                let buffer = self.buffers.get(buffer_id)?;
+                buffer.borrow().snapshot().is_dirty().then(|| path.clone())
+            })
+            .collect()
+    }
+
+    pub fn has_dirty_buffers(&self) -> bool {
+        self.path_to_buffer_id.iter().any(|(_, buffer_id)| {
+            self.buffers
+                .get(buffer_id)
+                .is_some_and(|buffer| buffer.borrow().snapshot().is_dirty())
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -125,6 +151,18 @@ impl Project {
 
     pub fn save_buffer(&mut self, path: &ProjectPath) -> io::Result<()> {
         self.buffer_store.save_buffer(path)
+    }
+
+    pub fn save_dirty_buffers(&mut self) -> io::Result<Vec<ProjectPath>> {
+        self.buffer_store.save_dirty_buffers()
+    }
+
+    pub fn dirty_buffers(&self) -> Vec<ProjectPath> {
+        self.buffer_store.dirty_paths()
+    }
+
+    pub fn has_dirty_buffers(&self) -> bool {
+        self.buffer_store.has_dirty_buffers()
     }
 
     pub fn buffer_store(&self) -> &BufferStore {
@@ -213,5 +251,76 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "hello zed");
         let buffer = project.buffer_store().buffer_for_path(&path).unwrap();
         assert!(!buffer.borrow().snapshot().is_dirty());
+    }
+
+    #[test]
+    fn dirty_buffers_lists_edited_paths_and_clears_after_save() {
+        let first_path = test_file_path("dirty-first");
+        let second_path = test_file_path("dirty-second");
+        std::fs::create_dir_all(first_path.parent().unwrap()).unwrap();
+        std::fs::write(&first_path, "first file").unwrap();
+        std::fs::write(&second_path, "second file").unwrap();
+
+        let mut project = Project::new();
+        let first = ProjectPath::new(1, first_path);
+        let second = ProjectPath::new(1, second_path);
+        let mut first_editor = project.open_editor_from_file(first.clone()).unwrap();
+        let _second_editor = project.open_editor_from_file(second.clone()).unwrap();
+
+        assert!(!project.has_dirty_buffers());
+        assert_eq!(project.dirty_buffers(), Vec::<ProjectPath>::new());
+
+        first_editor.select(0..5);
+        first_editor.insert_text("changed").unwrap();
+
+        assert!(project.has_dirty_buffers());
+        assert_eq!(project.dirty_buffers(), vec![first.clone()]);
+
+        project.save_buffer(&first).unwrap();
+
+        assert!(!project.has_dirty_buffers());
+        assert_eq!(project.dirty_buffers(), Vec::<ProjectPath>::new());
+    }
+
+    #[test]
+    fn saving_dirty_buffers_writes_all_dirty_files_and_returns_saved_paths() {
+        let first_path = test_file_path("save-dirty-first");
+        let second_path = test_file_path("save-dirty-second");
+        let clean_path = test_file_path("save-dirty-clean");
+        std::fs::create_dir_all(first_path.parent().unwrap()).unwrap();
+        std::fs::write(&first_path, "first file").unwrap();
+        std::fs::write(&second_path, "second file").unwrap();
+        std::fs::write(&clean_path, "clean file").unwrap();
+
+        let mut project = Project::new();
+        let first = ProjectPath::new(1, first_path.clone());
+        let second = ProjectPath::new(1, second_path.clone());
+        let clean = ProjectPath::new(1, clean_path.clone());
+        let mut first_editor = project.open_editor_from_file(first.clone()).unwrap();
+        let mut second_editor = project.open_editor_from_file(second.clone()).unwrap();
+        let _clean_editor = project.open_editor_from_file(clean.clone()).unwrap();
+
+        first_editor.select(0..5);
+        first_editor.insert_text("changed first").unwrap();
+        second_editor.select(0..6);
+        second_editor.insert_text("changed second").unwrap();
+
+        assert!(project.has_dirty_buffers());
+        assert_eq!(project.dirty_buffers(), vec![first.clone(), second.clone()]);
+
+        let saved_paths = project.save_dirty_buffers().unwrap();
+
+        assert_eq!(saved_paths, vec![first.clone(), second.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            "changed first file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second_path).unwrap(),
+            "changed second file"
+        );
+        assert_eq!(std::fs::read_to_string(&clean_path).unwrap(), "clean file");
+        assert!(!project.has_dirty_buffers());
+        assert_eq!(project.dirty_buffers(), Vec::<ProjectPath>::new());
     }
 }

@@ -1,0 +1,13 @@
+[package]
+name = "workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/workspace.rs"
+doctest = false
+
+[dependencies]
+project.workspace = true
+ui.workspace = true

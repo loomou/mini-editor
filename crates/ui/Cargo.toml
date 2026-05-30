@@ -1,0 +1,18 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/ui.rs"
+doctest = false
+
+[dependencies]
+editor.workspace = true
+
+gpui.workspace = true
+
+[dev-dependencies]
+language.workspace = true
+text.workspace = true

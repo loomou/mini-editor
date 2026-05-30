@@ -96,6 +96,18 @@ impl EditorModel {
         self.buffer.snapshot()
     }
 
+    pub fn title(&self) -> String {
+        self.snapshot()
+            .excerpts()
+            .first()
+            .map(|excerpt| excerpt.path_key.clone())
+            .unwrap_or_else(|| "untitled".to_string())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.snapshot().is_dirty()
+    }
+
     pub fn display_snapshot(&self, soft_wrap_column: Option<usize>) -> DisplaySnapshot {
         DisplayMap::new(soft_wrap_column).snapshot(&self.snapshot())
     }
@@ -455,5 +467,23 @@ mod tests {
 
         assert!(editor.redo().unwrap());
         assert_eq!(editor.snapshot().text(), "hello zed");
+    }
+
+    #[test]
+    fn editor_exposes_title_and_dirty_state_from_snapshot() {
+        let buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            language::SourceFile::new("src/main.rs"),
+            "hello world",
+        );
+        let mut editor = EditorModel::for_buffer("src/main.rs", buffer.into_handle());
+
+        assert_eq!(editor.title(), "src/main.rs");
+        assert!(!editor.is_dirty());
+
+        editor.select(6..11);
+        editor.insert_text("zed").unwrap();
+
+        assert!(editor.is_dirty());
     }
 }

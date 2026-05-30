@@ -5,8 +5,10 @@ members = [
     "crates/language",
     "crates/multibuffer",
     "crates/project",
+    "crates/rope",
     "crates/text",
-    "crates/rope"
+    "crates/ui",
+    "crates/workspace"
 ]
 resolver = "3"
 
@@ -24,3 +26,7 @@ multibuffer = { path = "crates/multibuffer" }
 project = { path = "crates/project" }
 rope = { path = "crates/rope" }
 text = { path = "crates/text" }
+ui = { path = "crates/ui" }
+workspace = { path = "crates/workspace" }
+
+gpui = "0.2.2"

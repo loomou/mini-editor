@@ -50,6 +50,10 @@ impl MultiBufferSnapshot {
         self.capability
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.buffers.values().any(BufferSnapshot::is_dirty)
+    }
+
     fn locate(&self, offset: usize) -> Option<(BufferId, usize)> {
         let mut cursor = 0;
         for excerpt in &self.excerpts {
@@ -283,5 +287,21 @@ mod tests {
 
         assert!(multibuffer.redo().unwrap());
         assert_eq!(multibuffer.snapshot().text(), "hello zed");
+    }
+
+    #[test]
+    fn snapshot_reports_dirty_when_any_backing_buffer_is_dirty() {
+        let buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            SourceFile::new("src/main.rs"),
+            "hello world",
+        );
+        let mut multibuffer = MultiBuffer::singleton("src/main.rs", buffer.into_handle());
+
+        assert!(!multibuffer.snapshot().is_dirty());
+
+        multibuffer.edit(6..11, "zed").unwrap();
+
+        assert!(multibuffer.snapshot().is_dirty());
     }
 }
