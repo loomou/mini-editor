@@ -8,10 +8,90 @@ pub struct RopePoint {
     pub column: usize,
 }
 
+impl RopePoint {
+    fn add(self, other: Self) -> Self {
+        if other.row == 0 {
+            Self {
+                row: self.row,
+                column: self.column + other.column,
+            }
+        } else {
+            Self {
+                row: self.row + other.row,
+                column: other.column,
+            }
+        }
+    }
+
+    fn subtract(self, other: Self) -> Self {
+        debug_assert!(other <= self);
+        if self.row == other.row {
+            Self {
+                row: 0,
+                column: self.column - other.column,
+            }
+        } else {
+            Self {
+                row: self.row - other.row,
+                column: self.column,
+            }
+        }
+    }
+}
+
+impl PartialOrd for RopePoint {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RopePoint {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.row
+            .cmp(&other.row)
+            .then_with(|| self.column.cmp(&other.column))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextSummary {
+    pub len: usize,
+    pub line_break_count: usize,
+    pub extent: RopePoint,
+}
+
+impl TextSummary {
+    pub fn from_text(text: &str) -> Self {
+        let mut summary = Self::default();
+        summary.len = text.len();
+
+        for character in text.chars() {
+            if character == '\n' {
+                summary.line_break_count += 1;
+                summary.extent.row += 1;
+                summary.extent.column = 0;
+            } else {
+                summary.extent.column += character.len_utf8();
+            }
+        }
+
+        summary
+    }
+
+    fn append(self, other: Self) -> Self {
+        Self {
+            len: self.len + other.len,
+            line_break_count: self.line_break_count + other.line_break_count,
+            extent: self.extent.add(other.extent),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RopeChunk {
     text: String,
     line_breaks: Vec<usize>,
+    summary: TextSummary,
 }
 
 impl RopeChunk {
@@ -21,7 +101,13 @@ impl RopeChunk {
             .enumerate()
             .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset))
             .collect();
-        Self { text, line_breaks }
+        let summary = TextSummary::from_text(&text);
+
+        Self {
+            text,
+            line_breaks,
+            summary,
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -40,14 +126,96 @@ impl RopeChunk {
         self.line_breaks.len()
     }
 
-    fn last_line_start(&self) -> Option<usize> {
-        self.line_breaks.last().map(|offset| offset + 1)
+    pub fn summary(&self) -> TextSummary {
+        self.summary
+    }
+
+    fn point_for_offset(&self, offset: usize) -> RopePoint {
+        let clipped = offset.min(self.len());
+        let mut row = 0;
+        let mut line_start = 0;
+
+        for line_break in &self.line_breaks {
+            if *line_break >= clipped {
+                break;
+            }
+            row += 1;
+            line_start = *line_break + 1;
+        }
+
+        RopePoint {
+            row,
+            column: clipped - line_start,
+        }
+    }
+
+    fn offset_for_point(&self, point: RopePoint) -> usize {
+        let mut current_row = 0;
+        let mut current_line_start = 0;
+
+        for line_break in &self.line_breaks {
+            if current_row == point.row {
+                return (current_line_start + point.column).min(*line_break);
+            }
+            current_row += 1;
+            current_line_start = *line_break + 1;
+        }
+
+        if current_row == point.row {
+            (current_line_start + point.column).min(self.len())
+        } else {
+            self.len()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RopeNode {
+    summary: TextSummary,
+    kind: RopeNodeKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RopeNodeKind {
+    Leaf {
+        chunk_index: usize,
+    },
+    Branch {
+        left: Box<RopeNode>,
+        right: Box<RopeNode>,
+    },
+}
+
+impl RopeNode {
+    fn leaf(chunk_index: usize, summary: TextSummary) -> Self {
+        Self {
+            summary,
+            kind: RopeNodeKind::Leaf { chunk_index },
+        }
+    }
+
+    fn branch(left: RopeNode, right: RopeNode) -> Self {
+        Self {
+            summary: left.summary.append(right.summary),
+            kind: RopeNodeKind::Branch {
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+        }
+    }
+
+    fn height(&self) -> usize {
+        match &self.kind {
+            RopeNodeKind::Leaf { .. } => 1,
+            RopeNodeKind::Branch { left, right } => 1 + left.height().max(right.height()),
+        }
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rope {
     chunks: Vec<RopeChunk>,
+    root: Option<Box<RopeNode>>,
     len: usize,
     line_break_count: usize,
 }
@@ -80,11 +248,26 @@ impl Rope {
             .collect::<Vec<_>>();
         let len = chunks.iter().map(RopeChunk::len).sum();
         let line_break_count = chunks.iter().map(RopeChunk::line_break_count).sum();
+        let root = Self::build_tree(&chunks, 0..chunks.len()).map(Box::new);
 
         Self {
             chunks,
+            root,
             len,
             line_break_count,
+        }
+    }
+
+    fn build_tree(chunks: &[RopeChunk], range: Range<usize>) -> Option<RopeNode> {
+        match range.end - range.start {
+            0 => None,
+            1 => Some(RopeNode::leaf(range.start, chunks[range.start].summary())),
+            _ => {
+                let mid = range.start + (range.end - range.start) / 2;
+                let left = Self::build_tree(chunks, range.start..mid)?;
+                let right = Self::build_tree(chunks, mid..range.end)?;
+                Some(RopeNode::branch(left, right))
+            }
         }
     }
 
@@ -102,6 +285,17 @@ impl Rope {
 
     pub fn chunks(&self) -> &[RopeChunk] {
         &self.chunks
+    }
+
+    pub fn summary(&self) -> TextSummary {
+        self.root
+            .as_ref()
+            .map(|root| root.summary)
+            .unwrap_or_default()
+    }
+
+    pub fn tree_height(&self) -> usize {
+        self.root.as_ref().map(|root| root.height()).unwrap_or(0)
     }
 
     pub fn chunk_texts(&self) -> Vec<&str> {
@@ -144,63 +338,67 @@ impl Rope {
 
     pub fn point_for_offset(&self, offset: usize) -> RopePoint {
         let clipped = offset.min(self.len);
-        let mut row = 0;
-        let mut line_start = 0;
-        let mut chunk_start = 0;
-
-        for chunk in &self.chunks {
-            let chunk_end = chunk_start + chunk.len();
-            if clipped > chunk_end {
-                row += chunk.line_break_count();
-                if let Some(last_line_start) = chunk.last_line_start() {
-                    line_start = chunk_start + last_line_start;
-                }
-                chunk_start = chunk_end;
-                continue;
-            }
-
-            for line_break in &chunk.line_breaks {
-                let absolute_break = chunk_start + *line_break;
-                if absolute_break >= clipped {
-                    break;
-                }
-                row += 1;
-                line_start = absolute_break + 1;
-            }
-
-            return RopePoint {
-                row,
-                column: clipped - line_start,
-            };
-        }
-
-        RopePoint {
-            row,
-            column: clipped.saturating_sub(line_start),
-        }
+        self.root
+            .as_ref()
+            .map(|root| self.point_for_offset_in_node(root, clipped, RopePoint::default()))
+            .unwrap_or_default()
     }
 
     pub fn offset_for_point(&self, point: RopePoint) -> usize {
-        let mut current_row = 0;
-        let mut current_line_start = 0;
-        let mut chunk_start = 0;
-
-        for chunk in &self.chunks {
-            for line_break in &chunk.line_breaks {
-                let absolute_break = chunk_start + *line_break;
-                if current_row == point.row {
-                    return (current_line_start + point.column).min(absolute_break);
-                }
-                current_row += 1;
-                current_line_start = absolute_break + 1;
-            }
-            chunk_start += chunk.len();
+        if point >= self.summary().extent {
+            return self.len;
         }
+        self.root
+            .as_ref()
+            .map(|root| self.offset_for_point_in_node(root, point, 0))
+            .unwrap_or_default()
+    }
 
-        if current_row == point.row {
-            (current_line_start + point.column).min(self.len)
-        } else {
-            self.len
+    fn point_for_offset_in_node(
+        &self,
+        node: &RopeNode,
+        offset: usize,
+        prefix: RopePoint,
+    ) -> RopePoint {
+        match &node.kind {
+            RopeNodeKind::Leaf { chunk_index } => {
+                prefix.add(self.chunks[*chunk_index].point_for_offset(offset))
+            }
+            RopeNodeKind::Branch { left, right } => {
+                if offset <= left.summary.len {
+                    self.point_for_offset_in_node(left, offset, prefix)
+                } else {
+                    self.point_for_offset_in_node(
+                        right,
+                        offset - left.summary.len,
+                        prefix.add(left.summary.extent),
+                    )
+                }
+            }
+        }
+    }
+
+    fn offset_for_point_in_node(
+        &self,
+        node: &RopeNode,
+        point: RopePoint,
+        prefix_len: usize,
+    ) -> usize {
+        match &node.kind {
+            RopeNodeKind::Leaf { chunk_index } => {
+                prefix_len + self.chunks[*chunk_index].offset_for_point(point)
+            }
+            RopeNodeKind::Branch { left, right } => {
+                if point <= left.summary.extent {
+                    self.offset_for_point_in_node(left, point, prefix_len)
+                } else {
+                    self.offset_for_point_in_node(
+                        right,
+                        point.subtract(left.summary.extent),
+                        prefix_len + left.summary.len,
+                    )
+                }
+            }
         }
     }
 }
@@ -222,8 +420,25 @@ mod tests {
         let rope = Rope::from_text_with_chunk_size("a\nb\ncd".to_string(), 3);
 
         assert_eq!(rope.line_count(), 3);
+        assert_eq!(
+            rope.summary(),
+            TextSummary {
+                len: 6,
+                line_break_count: 2,
+                extent: RopePoint { row: 2, column: 2 },
+            }
+        );
         assert_eq!(rope.chunks()[0].line_break_count(), 1);
         assert_eq!(rope.chunks()[1].line_break_count(), 1);
+    }
+
+    #[test]
+    fn builds_a_summary_tree_over_chunks() {
+        let rope = Rope::from_text_with_chunk_size("abcdefghijklmnop".to_string(), 2);
+
+        assert_eq!(rope.chunks().len(), 8);
+        assert_eq!(rope.tree_height(), 4);
+        assert_eq!(rope.summary().len, 16);
     }
 
     #[test]
@@ -239,6 +454,14 @@ mod tests {
 
         assert_eq!(rope.point_for_offset(3), RopePoint { row: 1, column: 1 });
         assert_eq!(rope.offset_for_point(RopePoint { row: 1, column: 2 }), 4);
+    }
+
+    #[test]
+    fn uses_tree_summaries_across_internal_nodes() {
+        let rope = Rope::from_text_with_chunk_size("ab\ncd\nef\ngh\nij".to_string(), 2);
+
+        assert_eq!(rope.point_for_offset(12), RopePoint { row: 4, column: 0 });
+        assert_eq!(rope.offset_for_point(RopePoint { row: 3, column: 1 }), 10);
     }
 
     #[test]
