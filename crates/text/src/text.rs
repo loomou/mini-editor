@@ -2,12 +2,13 @@ mod anchor;
 
 pub use anchor::BufferId;
 use anchor::{Anchor, Bias, Point};
+use rope::{Rope, RopePoint};
 use std::ops::Range;
 
 #[derive(Clone, Debug)]
 pub struct BufferSnapshot {
     id: BufferId,
-    text: String,
+    text: Rope,
     version: u64,
 }
 
@@ -16,8 +17,12 @@ impl BufferSnapshot {
         self.id
     }
 
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn text(&self) -> String {
+        self.text.text()
+    }
+
+    pub fn text_slice(&self, range: Range<usize>) -> String {
+        self.text.slice(range)
     }
 
     pub fn version(&self) -> u64 {
@@ -33,39 +38,19 @@ impl BufferSnapshot {
     }
 
     pub fn point_for_offset(&self, offset: usize) -> Point {
-        let clipped = offset.min(self.text.len());
-        let mut row = 0;
-        let mut line_start = 0;
-        for (index, byte) in self.text.bytes().enumerate().take(clipped) {
-            if byte == b'\n' {
-                row += 1;
-                line_start = index + 1;
-            }
-        }
+        let point = self.text.point_for_offset(offset);
 
         Point {
-            row,
-            column: clipped - line_start,
+            row: point.row,
+            column: point.column,
         }
     }
 
     pub fn offset_for_point(&self, point: Point) -> usize {
-        let mut row = 0;
-        let mut line_start = 0;
-        for (index, byte) in self.text.bytes().enumerate() {
-            if row == point.row {
-                return (line_start + point.column).min(self.line_end_offset(line_start));
-            }
-            if byte == b'\n' {
-                row += 1;
-                line_start = index + 1;
-            }
-        }
-        if row == point.row {
-            (line_start + point.column).min(self.text.len())
-        } else {
-            self.text.len()
-        }
+        self.text.offset_for_point(RopePoint {
+            row: point.row,
+            column: point.column,
+        })
     }
 
     pub fn anchor_before(&self, offset: usize) -> Anchor {
@@ -74,13 +59,6 @@ impl BufferSnapshot {
 
     pub fn anchor_after(&self, offset: usize) -> Anchor {
         Anchor::new(self.id, offset.min(self.text.len()), Bias::Right)
-    }
-
-    fn line_end_offset(&self, line_start: usize) -> usize {
-        self.text[line_start..]
-            .find('\n')
-            .map(|offset| line_start + offset)
-            .unwrap_or(self.text.len())
     }
 }
 
@@ -93,7 +71,7 @@ pub struct TextEdit {
 #[derive(Debug)]
 pub struct Buffer {
     id: BufferId,
-    text: String,
+    text: Rope,
     version: u64,
     anchors: Vec<Anchor>,
 }
@@ -102,7 +80,7 @@ impl Buffer {
     pub fn new(id: BufferId, text: impl Into<String>) -> Self {
         Self {
             id,
-            text: text.into(),
+            text: Rope::new(text.into()),
             version: 0,
             anchors: Vec::new(),
         }
@@ -136,8 +114,7 @@ impl Buffer {
             "edit range is out of bounds"
         );
         let inserted_len = edit.replacement.len();
-        self.text
-            .replace_range(edit.range.clone(), &edit.replacement);
+        self.text.replace(edit.range.clone(), edit.replacement);
         for anchor in &mut self.anchors {
             *anchor = anchor.transform(edit.range.clone(), inserted_len);
         }

@@ -119,7 +119,7 @@ impl MultiBuffer {
             .iter()
             .filter_map(|excerpt| {
                 let buffer = buffers.get(&excerpt.buffer_id)?;
-                Some(buffer.text.text()[excerpt.range.context.clone()].to_string())
+                Some(buffer.text.text_slice(excerpt.range.context.clone()))
             })
             .collect::<Vec<_>>()
             .join("\n");

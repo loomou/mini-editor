@@ -9,3 +9,4 @@ path = "src/text.rs"
 doctest = false
 
 [dependencies]
+rope.workspace = true
