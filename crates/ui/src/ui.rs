@@ -136,6 +136,7 @@ impl EditorView {
     pub fn rendered_lines(&self, soft_wrap_column: Option<usize>) -> Vec<RenderedLine> {
         let display = self.editor.display_snapshot(soft_wrap_column);
         let cursor = self.editor.cursor_display_point(soft_wrap_column).ok();
+        let selections = self.editor.resolved_selections();
 
         display
             .rows()
@@ -148,9 +149,7 @@ impl EditorView {
                     .filter(|cursor| cursor.row == row.row)
                     .map(|cursor| vec![cursor.column])
                     .unwrap_or_default(),
-                selection_ranges: self
-                    .editor
-                    .selections()
+                selection_ranges: selections
                     .iter()
                     .filter(|selection| !selection.is_empty())
                     .filter_map(|selection| {

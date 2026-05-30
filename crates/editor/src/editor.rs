@@ -1,6 +1,6 @@
 use display::{DisplayMap, DisplayPoint, DisplaySnapshot};
 use language::BufferHandle;
-use multibuffer::{MultiBuffer, MultiBufferSnapshot};
+use multibuffer::{MultiBuffer, MultiBufferAnchor, MultiBufferSnapshot};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -16,6 +16,8 @@ pub struct Selection {
     pub end: usize,
     pub reversed: bool,
     pub goal: SelectionGoal,
+    tail_anchor: Option<MultiBufferAnchor>,
+    head_anchor: Option<MultiBufferAnchor>,
 }
 
 impl Selection {
@@ -26,6 +28,8 @@ impl Selection {
             end: offset,
             reversed: false,
             goal: SelectionGoal::None,
+            tail_anchor: None,
+            head_anchor: None,
         }
     }
 
@@ -37,6 +41,8 @@ impl Selection {
                 end: anchor,
                 reversed: true,
                 goal: SelectionGoal::None,
+                tail_anchor: None,
+                head_anchor: None,
             }
         } else {
             Self {
@@ -45,6 +51,8 @@ impl Selection {
                 end: head,
                 reversed: false,
                 goal: SelectionGoal::None,
+                tail_anchor: None,
+                head_anchor: None,
             }
         }
     }
@@ -70,6 +78,8 @@ impl Selection {
         self.end = offset;
         self.reversed = false;
         self.goal = SelectionGoal::None;
+        self.tail_anchor = None;
+        self.head_anchor = None;
     }
 
     pub fn set_head(&mut self, head: usize) {
@@ -86,6 +96,15 @@ impl Selection {
             self.goal = SelectionGoal::None;
         }
     }
+
+    fn set_anchor_handles(
+        &mut self,
+        tail_anchor: MultiBufferAnchor,
+        head_anchor: MultiBufferAnchor,
+    ) {
+        self.tail_anchor = Some(tail_anchor);
+        self.head_anchor = Some(head_anchor);
+    }
 }
 
 #[derive(Debug)]
@@ -96,9 +115,13 @@ pub struct EditorModel {
 
 impl EditorModel {
     pub fn for_buffer(path_key: impl Into<String>, buffer: BufferHandle) -> Self {
+        let mut buffer = MultiBuffer::singleton(path_key, buffer);
+        let mut selection = Selection::caret(0);
+        attach_selection_anchors(&mut buffer, &mut selection);
+
         Self {
-            buffer: MultiBuffer::singleton(path_key, buffer),
-            selections: vec![Selection::caret(0)],
+            buffer,
+            selections: vec![selection],
         }
     }
 
@@ -126,33 +149,35 @@ impl EditorModel {
         &self.selections
     }
 
+    pub fn resolved_selections(&self) -> Vec<Selection> {
+        self.selections
+            .iter()
+            .map(|selection| resolve_selection_from_anchors(&self.buffer, selection))
+            .collect()
+    }
+
     pub fn select(&mut self, range: Range<usize>) {
-        let snapshot = self.snapshot();
-        let text = snapshot.text();
-        let start = floor_char_boundary(text, range.start);
-        let end = floor_char_boundary(text, range.end);
-        self.selections = vec![Selection::from_anchor_head(
+        let text = self.snapshot().text().to_string();
+        let start = floor_char_boundary(&text, range.start);
+        let end = floor_char_boundary(&text, range.end);
+        self.set_single_selection(Selection::from_anchor_head(
             0,
             start.min(end),
             start.max(end),
-        )];
+        ));
     }
 
     pub fn select_anchor_head(&mut self, anchor: usize, head: usize) {
-        let snapshot = self.snapshot();
-        let text = snapshot.text();
-        self.selections = vec![Selection::from_anchor_head(
+        let text = self.snapshot().text().to_string();
+        self.set_single_selection(Selection::from_anchor_head(
             0,
-            floor_char_boundary(text, anchor),
-            floor_char_boundary(text, head),
-        )];
+            floor_char_boundary(&text, anchor),
+            floor_char_boundary(&text, head),
+        ));
     }
 
     pub fn cursor_offset(&self) -> Result<usize, String> {
-        self.selections
-            .first()
-            .map(Selection::head)
-            .ok_or_else(|| "editor has no active selection".to_string())
+        Ok(self.active_selection()?.head())
     }
 
     pub fn cursor_display_point(
@@ -166,14 +191,10 @@ impl EditorModel {
     }
 
     pub fn move_left(&mut self, extend: bool) -> Result<(), String> {
-        let selection = self
-            .selections
-            .first()
-            .ok_or_else(|| "editor has no active selection".to_string())?
-            .clone();
+        let selection = self.active_selection()?;
 
         if !extend && !selection.is_empty() {
-            self.selections = vec![Selection::caret(selection.start)];
+            self.set_single_selection(Selection::caret(selection.start));
             return Ok(());
         }
 
@@ -183,14 +204,10 @@ impl EditorModel {
     }
 
     pub fn move_right(&mut self, extend: bool) -> Result<(), String> {
-        let selection = self
-            .selections
-            .first()
-            .ok_or_else(|| "editor has no active selection".to_string())?
-            .clone();
+        let selection = self.active_selection()?;
 
         if !extend && !selection.is_empty() {
-            self.selections = vec![Selection::caret(selection.end)];
+            self.set_single_selection(Selection::caret(selection.end));
             return Ok(());
         }
 
@@ -200,28 +217,22 @@ impl EditorModel {
     }
 
     fn move_active_head(&mut self, target: usize, extend: bool) -> Result<(), String> {
-        let selection = self
-            .selections
-            .first_mut()
-            .ok_or_else(|| "editor has no active selection".to_string())?;
+        let mut selection = self.active_selection()?;
         if extend {
             selection.set_head(target);
         } else {
             selection.collapse_to(target);
         }
+        self.set_single_selection(selection.clone());
         Ok(())
     }
 
     pub fn insert_text(&mut self, text: impl Into<String>) -> Result<(), String> {
-        let selection = self
-            .selections
-            .first()
-            .ok_or_else(|| "editor has no active selection".to_string())?
-            .clone();
+        let selection = self.active_selection()?;
         let replacement = text.into();
         let cursor = selection.start + replacement.len();
         self.buffer.edit(selection.range(), replacement)?;
-        self.selections = vec![Selection::caret(cursor)];
+        self.set_single_selection(Selection::caret(cursor));
         Ok(())
     }
 
@@ -230,11 +241,7 @@ impl EditorModel {
     }
 
     pub fn backspace(&mut self) -> Result<bool, String> {
-        let selection = self
-            .selections
-            .first()
-            .ok_or_else(|| "editor has no active selection".to_string())?
-            .clone();
+        let selection = self.active_selection()?;
 
         if !selection.is_empty() {
             return self.delete_range(selection.range());
@@ -247,11 +254,7 @@ impl EditorModel {
     }
 
     pub fn delete(&mut self) -> Result<bool, String> {
-        let selection = self
-            .selections
-            .first()
-            .ok_or_else(|| "editor has no active selection".to_string())?
-            .clone();
+        let selection = self.active_selection()?;
 
         if !selection.is_empty() {
             return self.delete_range(selection.range());
@@ -269,16 +272,24 @@ impl EditorModel {
         }
 
         self.buffer.edit(range.clone(), "")?;
-        self.selections = vec![Selection::caret(range.start)];
+        self.set_single_selection(Selection::caret(range.start));
         Ok(true)
     }
 
     pub fn undo(&mut self) -> Result<bool, String> {
-        self.buffer.undo()
+        let changed = self.buffer.undo()?;
+        if changed {
+            self.sync_selections_to_anchors();
+        }
+        Ok(changed)
     }
 
     pub fn redo(&mut self) -> Result<bool, String> {
-        self.buffer.redo()
+        let changed = self.buffer.redo()?;
+        if changed {
+            self.sync_selections_to_anchors();
+        }
+        Ok(changed)
     }
 
     pub fn refresh_buffer_ranges(&mut self) {
@@ -287,6 +298,77 @@ impl EditorModel {
         for selection in &mut self.selections {
             selection.clamp_to_text(&text);
         }
+        self.reattach_selection_anchors();
+    }
+
+    fn set_single_selection(&mut self, mut selection: Selection) {
+        attach_selection_anchors(&mut self.buffer, &mut selection);
+        self.selections = vec![selection];
+    }
+
+    fn active_selection(&self) -> Result<Selection, String> {
+        self.selections
+            .first()
+            .map(|selection| resolve_selection_from_anchors(&self.buffer, selection))
+            .ok_or_else(|| "editor has no active selection".to_string())
+    }
+
+    fn sync_selections_to_anchors(&mut self) {
+        let buffer = &self.buffer;
+        for selection in &mut self.selections {
+            *selection = resolve_selection_from_anchors(buffer, selection);
+        }
+    }
+
+    fn reattach_selection_anchors(&mut self) {
+        let buffer = &mut self.buffer;
+        for selection in &mut self.selections {
+            attach_selection_anchors(buffer, selection);
+        }
+    }
+}
+
+fn resolve_selection_from_anchors(buffer: &MultiBuffer, selection: &Selection) -> Selection {
+    let Some(tail_anchor) = selection.tail_anchor else {
+        return selection.clone();
+    };
+    let Some(head_anchor) = selection.head_anchor else {
+        return selection.clone();
+    };
+    let Some(tail) = buffer.offset_for_tracked_anchor(tail_anchor) else {
+        return selection.clone();
+    };
+    let Some(head) = buffer.offset_for_tracked_anchor(head_anchor) else {
+        return selection.clone();
+    };
+
+    let mut resolved = Selection::from_anchor_head(selection.id, tail, head);
+    resolved.goal = selection.goal;
+    resolved.set_anchor_handles(tail_anchor, head_anchor);
+    if resolved.is_empty() {
+        resolved.goal = SelectionGoal::None;
+    }
+    resolved
+}
+
+fn attach_selection_anchors(buffer: &mut MultiBuffer, selection: &mut Selection) {
+    let tail = selection.tail();
+    let head = selection.head();
+    let tail_anchor = if selection.is_empty() {
+        buffer.track_anchor_after(tail)
+    } else if selection.reversed {
+        buffer.track_anchor_after(tail)
+    } else {
+        buffer.track_anchor_before(tail)
+    };
+    let head_anchor = if selection.is_empty() || !selection.reversed {
+        buffer.track_anchor_after(head)
+    } else {
+        buffer.track_anchor_before(head)
+    };
+
+    if let (Some(tail_anchor), Some(head_anchor)) = (tail_anchor, head_anchor) {
+        selection.set_anchor_handles(tail_anchor, head_anchor);
     }
 }
 
@@ -448,6 +530,29 @@ mod tests {
     }
 
     #[test]
+    fn movement_uses_resolved_selection_after_buffer_edits() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select(6..6);
+
+        editor.buffer.edit(0..0, "say ").unwrap();
+        editor.move_right(false).unwrap();
+
+        assert_eq!(editor.snapshot().text(), "say hello world");
+        assert_eq!(editor.cursor_offset().unwrap(), 11);
+
+        let buffer = Buffer::local(BufferId::new(2).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select(6..11);
+
+        editor.buffer.edit(0..0, "say ").unwrap();
+        editor.move_left(false).unwrap();
+
+        assert_eq!(editor.cursor_offset().unwrap(), 10);
+        assert_eq!(editor.selections()[0].range(), 10..10);
+    }
+
+    #[test]
     fn cursor_display_point_uses_display_map() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
         let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
@@ -485,6 +590,85 @@ mod tests {
 
         assert!(editor.redo().unwrap());
         assert_eq!(editor.snapshot().text(), "hello zed");
+    }
+
+    #[test]
+    fn selection_offsets_sync_from_tracked_anchors_after_buffer_edits() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select(6..6);
+
+        editor.buffer.edit(0..0, "say ").unwrap();
+        editor.sync_selections_to_anchors();
+
+        assert_eq!(editor.snapshot().text(), "say hello world");
+        assert_eq!(editor.cursor_offset().unwrap(), 10);
+    }
+
+    #[test]
+    fn cursor_queries_resolve_selection_anchors_without_mutating_cached_offsets() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select(6..6);
+
+        editor.buffer.edit(0..0, "say ").unwrap();
+
+        assert_eq!(editor.snapshot().text(), "say hello world");
+        assert_eq!(editor.selections()[0].head(), 6);
+        assert_eq!(editor.cursor_offset().unwrap(), 10);
+        assert_eq!(editor.resolved_selections()[0].head(), 10);
+    }
+
+    #[test]
+    fn insertion_uses_resolved_selection_after_buffer_edits() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select(6..11);
+
+        editor.buffer.edit(0..0, "say ").unwrap();
+        editor.insert_text("zed").unwrap();
+
+        assert_eq!(editor.snapshot().text(), "say hello zed");
+        assert_eq!(editor.cursor_offset().unwrap(), 13);
+    }
+
+    #[test]
+    fn deletion_uses_resolved_selection_after_buffer_edits() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select(6..6);
+
+        editor.buffer.edit(0..0, "say ").unwrap();
+        assert!(editor.backspace().unwrap());
+
+        assert_eq!(editor.snapshot().text(), "say helloworld");
+        assert_eq!(editor.cursor_offset().unwrap(), 9);
+
+        let buffer = Buffer::local(BufferId::new(2).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select(6..6);
+
+        editor.buffer.edit(0..0, "say ").unwrap();
+        assert!(editor.delete().unwrap());
+
+        assert_eq!(editor.snapshot().text(), "say hello orld");
+        assert_eq!(editor.cursor_offset().unwrap(), 10);
+    }
+
+    #[test]
+    fn reversed_selection_syncs_head_and_tail_from_tracked_anchors() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_anchor_head(8, 2);
+
+        editor.buffer.edit(0..0, "say ").unwrap();
+        editor.sync_selections_to_anchors();
+
+        let selection = &editor.selections()[0];
+        assert_eq!(selection.range(), 6..12);
+        assert_eq!(selection.head(), 6);
+        assert_eq!(selection.tail(), 12);
+        assert!(selection.reversed);
     }
 
     #[test]

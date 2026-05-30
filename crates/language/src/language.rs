@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use text::{Buffer as TextBuffer, BufferId, BufferSnapshot as TextSnapshot, TextEdit};
+use text::{Anchor, Buffer as TextBuffer, BufferId, BufferSnapshot as TextSnapshot, TextEdit};
 
 pub type BufferHandle = Rc<RefCell<Buffer>>;
 
@@ -53,6 +53,18 @@ impl BufferSnapshot {
         self.text.id()
     }
 
+    pub fn anchor_before(&self, offset: usize) -> Anchor {
+        self.text.anchor_before(offset)
+    }
+
+    pub fn anchor_after(&self, offset: usize) -> Anchor {
+        self.text.anchor_after(offset)
+    }
+
+    pub fn offset_for_anchor(&self, anchor: Anchor) -> Option<usize> {
+        self.text.offset_for_anchor(anchor)
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.text.version() != self.saved_version
     }
@@ -96,6 +108,14 @@ impl Buffer {
 
     pub fn id(&self) -> BufferId {
         self.text.id()
+    }
+
+    pub fn track_anchor(&mut self, anchor: Anchor) -> usize {
+        self.text.track_anchor(anchor)
+    }
+
+    pub fn tracked_anchor(&self, index: usize) -> Option<Anchor> {
+        self.text.tracked_anchor(index)
     }
 
     pub fn snapshot(&self) -> BufferSnapshot {
@@ -284,5 +304,33 @@ mod tests {
 
         assert_eq!(buffer.snapshot().text.text(), "hello");
         assert!(!buffer.snapshot().is_dirty());
+    }
+
+    #[test]
+    fn snapshot_creates_and_resolves_text_anchors() {
+        let mut buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let anchor = buffer.snapshot().anchor_after(6);
+        let tracked_anchor = buffer.track_anchor(anchor);
+
+        buffer
+            .edit(TextEdit {
+                range: 6..11,
+                replacement: "zed".to_string(),
+            })
+            .unwrap();
+
+        let snapshot = buffer.snapshot();
+        assert_eq!(
+            snapshot.offset_for_anchor(buffer.tracked_anchor(tracked_anchor).unwrap()),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_anchors_from_another_buffer() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello");
+        let other_anchor = Anchor::new(BufferId::new(2).unwrap(), 1, text::Bias::Left);
+
+        assert_eq!(buffer.snapshot().offset_for_anchor(other_anchor), None);
     }
 }

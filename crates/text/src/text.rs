@@ -1,7 +1,7 @@
 mod anchor;
 
-pub use anchor::BufferId;
-use anchor::{Anchor, Bias, Point};
+use anchor::Point;
+pub use anchor::{Anchor, Bias, BufferId};
 use rope::{Rope, RopePoint};
 use std::ops::Range;
 
@@ -59,6 +59,23 @@ impl BufferSnapshot {
 
     pub fn anchor_after(&self, offset: usize) -> Anchor {
         Anchor::new(self.id, offset.min(self.text.len()), Bias::Right)
+    }
+
+    pub fn offset_for_anchor(&self, anchor: Anchor) -> Option<usize> {
+        if anchor.buffer_id() != self.id {
+            return None;
+        }
+
+        Some(self.floor_char_boundary(anchor.offset()))
+    }
+
+    fn floor_char_boundary(&self, offset: usize) -> usize {
+        let text = self.text.text();
+        let mut clipped = offset.min(text.len());
+        while clipped > 0 && !text.is_char_boundary(clipped) {
+            clipped -= 1;
+        }
+        clipped
     }
 }
 
@@ -191,6 +208,61 @@ mod tests {
         assert_eq!(buffer.snapshot().text(), "hello zed");
         assert_eq!(buffer.tracked_anchor(left).unwrap().offset(), 6);
         assert_eq!(buffer.tracked_anchor(right).unwrap().offset(), 9);
+        assert_eq!(
+            buffer
+                .snapshot()
+                .offset_for_anchor(buffer.tracked_anchor(left).unwrap()),
+            Some(6)
+        );
+        assert_eq!(
+            buffer
+                .snapshot()
+                .offset_for_anchor(buffer.tracked_anchor(right).unwrap()),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn anchors_resolve_to_current_offsets_after_deletion() {
+        let mut buffer = Buffer::new(BufferId::new(1).unwrap(), "hello world");
+        let left = buffer.track_anchor(buffer.snapshot().anchor_before(6));
+        let right = buffer.track_anchor(buffer.snapshot().anchor_after(6));
+
+        buffer.edit(TextEdit {
+            range: 0..6,
+            replacement: String::new(),
+        });
+
+        let snapshot = buffer.snapshot();
+        assert_eq!(
+            snapshot.offset_for_anchor(buffer.tracked_anchor(left).unwrap()),
+            Some(0)
+        );
+        assert_eq!(
+            snapshot.offset_for_anchor(buffer.tracked_anchor(right).unwrap()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn offset_for_anchor_rejects_anchors_from_other_buffers() {
+        let buffer = Buffer::new(BufferId::new(1).unwrap(), "hello");
+        let other_anchor = Anchor::new(BufferId::new(2).unwrap(), 3, Bias::Left);
+
+        assert_eq!(buffer.snapshot().offset_for_anchor(other_anchor), None);
+    }
+
+    #[test]
+    fn offset_for_anchor_clips_to_utf8_boundary() {
+        let buffer = Buffer::new(BufferId::new(1).unwrap(), "aé");
+        let inside_multibyte_character = Anchor::new(buffer.id(), 2, Bias::Right);
+
+        assert_eq!(
+            buffer
+                .snapshot()
+                .offset_for_anchor(inside_multibyte_character),
+            Some(1)
+        );
     }
 
     #[test]
