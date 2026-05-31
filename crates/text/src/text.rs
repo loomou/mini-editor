@@ -4,6 +4,7 @@ use anchor::Point;
 pub use anchor::{Anchor, Bias, BufferId};
 use rope::{Rope, RopePoint};
 use std::ops::Range;
+use std::rc::Rc;
 
 #[derive(Clone, Debug)]
 pub struct BufferSnapshot {
@@ -82,7 +83,7 @@ impl BufferSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextEdit {
     pub range: Range<usize>,
-    pub replacement: String,
+    pub replacement: Rc<str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,12 +145,12 @@ impl Buffer {
         }
 
         let mut undo_edits = Vec::new();
-        for edit in edits.iter().cloned() {
+        for edit in &edits {
             let deleted_text = self.text.slice(edit.range.clone());
             let undo_range = edit.range.start..edit.range.start + edit.replacement.len();
             undo_edits.push(TextEdit {
                 range: undo_range,
-                replacement: deleted_text,
+                replacement: deleted_text.into(),
             });
             self.apply_edit(edit);
         }
@@ -176,7 +177,7 @@ impl Buffer {
         let Some(history_entry) = self.undo_stack.pop() else {
             return false;
         };
-        for edit in history_entry.undo.iter().cloned() {
+        for edit in &history_entry.undo {
             self.apply_edit(edit);
         }
         self.redo_stack.push(history_entry);
@@ -187,21 +188,22 @@ impl Buffer {
         let Some(history_entry) = self.redo_stack.pop() else {
             return false;
         };
-        for edit in history_entry.redo.iter().cloned() {
+        for edit in &history_entry.redo {
             self.apply_edit(edit);
         }
         self.undo_stack.push(history_entry);
         true
     }
 
-    fn apply_edit(&mut self, edit: TextEdit) {
+    fn apply_edit(&mut self, edit: &TextEdit) {
         assert!(edit.range.start <= edit.range.end, "edit range is reversed");
         assert!(
             edit.range.end <= self.text.len(),
             "edit range is out of bounds"
         );
         let inserted_len = edit.replacement.len();
-        self.text.replace(edit.range.clone(), edit.replacement);
+        self.text
+            .replace(edit.range.clone(), edit.replacement.as_ref());
         for anchor in &mut self.anchors {
             *anchor = anchor.transform(edit.range.clone(), inserted_len);
         }
@@ -221,7 +223,7 @@ mod tests {
 
         buffer.edit(TextEdit {
             range: 6..11,
-            replacement: "zed".to_string(),
+            replacement: "zed".to_string().into(),
         });
 
         assert_eq!(buffer.snapshot().text(), "hello zed");
@@ -249,7 +251,7 @@ mod tests {
 
         buffer.edit(TextEdit {
             range: 0..6,
-            replacement: String::new(),
+            replacement: String::new().into(),
         });
 
         let snapshot = buffer.snapshot();
@@ -299,7 +301,7 @@ mod tests {
 
         buffer.edit(TextEdit {
             range: 6..11,
-            replacement: "zed".to_string(),
+            replacement: "zed".to_string().into(),
         });
 
         assert_eq!(buffer.snapshot().text(), "hello zed");
@@ -318,11 +320,11 @@ mod tests {
         buffer.edit_group(vec![
             TextEdit {
                 range: 8..13,
-                replacement: "3".to_string(),
+                replacement: "3".to_string().into(),
             },
             TextEdit {
                 range: 0..3,
-                replacement: "1".to_string(),
+                replacement: "1".to_string().into(),
             },
         ]);
 

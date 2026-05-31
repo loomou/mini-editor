@@ -2,6 +2,7 @@ use display::{DisplayMap, DisplayPoint, DisplaySnapshot};
 use language::BufferHandle;
 use multibuffer::{MultiBuffer, MultiBufferAnchor, MultiBufferEdit, MultiBufferSnapshot};
 use std::ops::Range;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SelectionGoal {
@@ -276,17 +277,17 @@ impl EditorModel {
     }
 
     pub fn insert_text(&mut self, text: impl Into<String>) -> Result<(), String> {
-        let replacement = text.into();
+        let replacement: Rc<str> = text.into().into();
         let selections = self.resolved_selections();
         let undo_selections = selections.clone();
         let undo_active_selection_index = self.active_selection_index;
-        let sorted_selections = sorted_non_overlapping_selections(selections.clone())?;
+        let sorted_selections = sorted_non_overlapping_selections(&selections)?;
         let replacement_len = isize::try_from(replacement.len())
             .map_err(|_| "replacement text is too large".to_string())?;
         let mut next_selections = selections;
         let mut delta = 0isize;
 
-        for (selection_index, selection) in &sorted_selections {
+        for selection in &sorted_selections {
             let start = selection
                 .start
                 .checked_add_signed(delta)
@@ -296,9 +297,9 @@ impl EditorModel {
                 .ok_or_else(|| "cursor offset overflowed while inserting text".to_string())?;
             let mut caret = Selection::caret(cursor);
             caret.id = selection.id;
-            next_selections[*selection_index] = caret;
+            next_selections[selection.selection_index] = caret;
 
-            let range_len = isize::try_from(selection.range().len())
+            let range_len = isize::try_from(selection.range.len())
                 .map_err(|_| "selection range is too large".to_string())?;
             delta = delta
                 .checked_add(replacement_len - range_len)
@@ -311,8 +312,8 @@ impl EditorModel {
             sorted_selections
                 .iter()
                 .rev()
-                .map(|(_, selection)| MultiBufferEdit {
-                    range: selection.range(),
+                .map(|selection| MultiBufferEdit {
+                    range: selection.range.clone(),
                     replacement: replacement.clone(),
                 })
                 .collect(),
@@ -429,7 +430,7 @@ impl EditorModel {
             return Ok(false);
         }
 
-        let sorted_edit_ranges = sorted_non_overlapping_edit_ranges(edit_ranges.clone())?;
+        let sorted_edit_ranges = sorted_non_overlapping_edit_ranges(&edit_ranges)?;
         let undo_selections = self.resolved_selections();
         let undo_active_selection_index = self.active_selection_index;
         let mut next_selections = edit_ranges
@@ -462,7 +463,7 @@ impl EditorModel {
                 .filter(|edit_range| !edit_range.range.is_empty())
                 .map(|edit_range| MultiBufferEdit {
                     range: edit_range.range.clone(),
-                    replacement: String::new(),
+                    replacement: Rc::<str>::from(""),
                 })
                 .collect(),
         )?;
@@ -607,15 +608,34 @@ fn selections_overlap_or_duplicate(left: &Selection, right: &Selection) -> bool 
     left.start < right.end && right.start < left.end
 }
 
+#[derive(Clone, Debug)]
+struct SortedSelection {
+    selection_index: usize,
+    start: usize,
+    end: usize,
+    id: usize,
+    range: Range<usize>,
+}
+
 fn sorted_non_overlapping_selections(
-    selections: Vec<Selection>,
-) -> Result<Vec<(usize, Selection)>, String> {
-    let mut sorted_selections = selections.into_iter().enumerate().collect::<Vec<_>>();
-    sorted_selections.sort_by_key(|(_, selection)| (selection.start, selection.end));
+    selections: &[Selection],
+) -> Result<Vec<SortedSelection>, String> {
+    let mut sorted_selections = selections
+        .iter()
+        .enumerate()
+        .map(|(selection_index, selection)| SortedSelection {
+            selection_index,
+            start: selection.start,
+            end: selection.end,
+            id: selection.id,
+            range: selection.range(),
+        })
+        .collect::<Vec<_>>();
+    sorted_selections.sort_by_key(|selection| (selection.start, selection.end));
 
     for window in sorted_selections.windows(2) {
-        let previous = &window[0].1;
-        let current = &window[1].1;
+        let previous = &window[0];
+        let current = &window[1];
         if previous.end > current.start {
             return Err(format!(
                 "selection {} overlaps selection {}",
@@ -628,9 +648,9 @@ fn sorted_non_overlapping_selections(
 }
 
 fn sorted_non_overlapping_edit_ranges(
-    edit_ranges: Vec<SelectionEditRange>,
+    edit_ranges: &[SelectionEditRange],
 ) -> Result<Vec<SelectionEditRange>, String> {
-    let mut sorted_edit_ranges = edit_ranges;
+    let mut sorted_edit_ranges = edit_ranges.to_vec();
     sorted_edit_ranges.sort_by_key(|edit_range| (edit_range.range.start, edit_range.range.end));
 
     for window in sorted_edit_ranges.windows(2) {

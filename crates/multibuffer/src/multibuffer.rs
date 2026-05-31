@@ -1,6 +1,7 @@
 use language::{BufferHandle, BufferSnapshot, Capability};
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::rc::Rc;
 use text::{Anchor, BufferId, TextEdit};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +45,7 @@ impl MultiBufferAnchor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultiBufferEdit {
     pub range: Range<usize>,
-    pub replacement: String,
+    pub replacement: Rc<str>,
 }
 
 #[derive(Clone, Debug)]
@@ -224,7 +225,7 @@ impl MultiBuffer {
     ) -> Result<(), String> {
         self.edit_group(vec![MultiBufferEdit {
             range,
-            replacement: replacement.into(),
+            replacement: Rc::<str>::from(replacement.into()),
         }])
     }
 
@@ -464,11 +465,11 @@ mod tests {
             .edit_group(vec![
                 MultiBufferEdit {
                     range: 8..13,
-                    replacement: "3".to_string(),
+                    replacement: "3".to_string().into(),
                 },
                 MultiBufferEdit {
                     range: 0..3,
-                    replacement: "1".to_string(),
+                    replacement: "1".to_string().into(),
                 },
             ])
             .unwrap();

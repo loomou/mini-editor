@@ -222,7 +222,12 @@ impl Workspace {
     pub fn switch_to_editor(&mut self, path: &ProjectPath) -> Result<(), String> {
         self.activate_existing_editor(path)
             .then_some(())
-            .ok_or_else(|| format!("workspace has no open editor for {}", path.path.display()))
+            .ok_or_else(|| {
+                format!(
+                    "workspace has no open editor for {}",
+                    path.path.as_path().display()
+                )
+            })
     }
 
     pub fn close_editor(&mut self, path: &ProjectPath) -> Result<ProjectPath, String> {
@@ -230,7 +235,12 @@ impl Workspace {
             .open_editors
             .iter()
             .position(|editor| editor.path == *path)
-            .ok_or_else(|| format!("workspace has no open editor for {}", path.path.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "workspace has no open editor for {}",
+                    path.path.as_path().display()
+                )
+            })?;
         self.close_editor_at(index, DirtyClosePolicy::Reject)
     }
 
@@ -246,7 +256,12 @@ impl Workspace {
             .open_editors
             .iter()
             .position(|editor| editor.path == *path)
-            .ok_or_else(|| format!("workspace has no open editor for {}", path.path.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "workspace has no open editor for {}",
+                    path.path.as_path().display()
+                )
+            })?;
         self.close_editor_at(index, DirtyClosePolicy::Save)
     }
 
@@ -262,7 +277,12 @@ impl Workspace {
             .open_editors
             .iter()
             .position(|editor| editor.path == *path)
-            .ok_or_else(|| format!("workspace has no open editor for {}", path.path.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "workspace has no open editor for {}",
+                    path.path.as_path().display()
+                )
+            })?;
         self.close_editor_at(index, DirtyClosePolicy::Discard)
     }
 
@@ -369,7 +389,7 @@ impl Workspace {
                 DirtyClosePolicy::Reject => {
                     return Err(format!(
                         "cannot close dirty editor without saving {}",
-                        path.path.display()
+                        path.path.as_path().display()
                     ));
                 }
                 DirtyClosePolicy::Save => self

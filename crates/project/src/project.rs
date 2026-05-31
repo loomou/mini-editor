@@ -4,25 +4,26 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::SystemTime;
 use text::BufferId;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProjectPath {
     pub worktree_id: u64,
-    pub path: PathBuf,
+    pub path: Rc<PathBuf>,
 }
 
 impl ProjectPath {
     pub fn new(worktree_id: u64, path: impl Into<PathBuf>) -> Self {
         Self {
             worktree_id,
-            path: path.into(),
+            path: Rc::new(path.into()),
         }
     }
 
     pub fn path_key(&self) -> String {
-        self.path.display().to_string()
+        self.path.as_path().display().to_string()
     }
 }
 
@@ -52,7 +53,8 @@ impl BufferStore {
 
         self.next_buffer_id += 1;
         let buffer_id = BufferId::new(self.next_buffer_id).expect("buffer ids start at one");
-        let buffer = Buffer::from_file(buffer_id, SourceFile::new(path.path.clone()), text);
+        let buffer =
+            Buffer::from_file(buffer_id, SourceFile::new(path.path.as_ref().clone()), text);
         let buffer = buffer.into_handle();
         self.buffers.insert(buffer_id, buffer.clone());
         self.file_metadata
@@ -66,7 +68,7 @@ impl BufferStore {
             return Ok(buffer);
         }
 
-        let text = fs::read_to_string(&path.path)?;
+        let text = fs::read_to_string(path.path.as_ref())?;
         let metadata = read_file_metadata(&path);
         let buffer = self.open_buffer(path.clone(), text);
         self.file_metadata.insert(path, metadata);
@@ -77,15 +79,15 @@ impl BufferStore {
         let buffer = self.buffer_for_path(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("no open buffer for {}", path.path.display()),
+                format!("no open buffer for {}", path.path.as_path().display()),
             )
         })?;
         let text = buffer.borrow().snapshot().text.text();
 
-        if let Some(parent) = path.path.parent() {
+        if let Some(parent) = path.path.as_path().parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path.path, text)?;
+        fs::write(path.path.as_ref(), text)?;
         buffer.borrow_mut().save();
         self.file_metadata
             .insert(path.clone(), read_file_metadata(path));
@@ -104,7 +106,7 @@ impl BufferStore {
         let buffer = self.buffer_for_path(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("no open buffer for {}", path.path.display()),
+                format!("no open buffer for {}", path.path.as_path().display()),
             )
         })?;
         buffer
@@ -117,17 +119,17 @@ impl BufferStore {
         let buffer = self.buffer_for_path(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("no open buffer for {}", path.path.display()),
+                format!("no open buffer for {}", path.path.as_path().display()),
             )
         })?;
         if buffer.borrow().snapshot().is_dirty() {
             return Err(io::Error::other(format!(
                 "cannot reload dirty buffer {}",
-                path.path.display()
+                path.path.as_path().display()
             )));
         }
 
-        let text = fs::read_to_string(&path.path)?;
+        let text = fs::read_to_string(path.path.as_ref())?;
         let changed = buffer.borrow_mut().reload_saved_text(text);
         self.file_metadata
             .insert(path.clone(), read_file_metadata(path));
@@ -138,10 +140,10 @@ impl BufferStore {
         let buffer = self.buffer_for_path(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("no open buffer for {}", path.path.display()),
+                format!("no open buffer for {}", path.path.as_path().display()),
             )
         })?;
-        let text = fs::read_to_string(&path.path)?;
+        let text = fs::read_to_string(path.path.as_ref())?;
         let changed = buffer.borrow_mut().reload_saved_text(text);
         self.file_metadata
             .insert(path.clone(), read_file_metadata(path));
@@ -210,7 +212,7 @@ impl FileMetadata {
 }
 
 fn read_file_metadata(path: &ProjectPath) -> FileMetadata {
-    let Ok(metadata) = fs::metadata(&path.path) else {
+    let Ok(metadata) = fs::metadata(path.path.as_ref()) else {
         return FileMetadata::missing();
     };
     FileMetadata {

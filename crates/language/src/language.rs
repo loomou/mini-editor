@@ -197,7 +197,7 @@ impl Buffer {
 
         self.text.edit(TextEdit {
             range: 0..snapshot.len(),
-            replacement: self.saved_text.clone(),
+            replacement: self.saved_text.clone().into(),
         });
         self.saved_version = self.text.snapshot().version();
         Ok(true)
@@ -215,7 +215,7 @@ impl Buffer {
 
         self.text.edit(TextEdit {
             range: 0..snapshot.len(),
-            replacement: text.clone(),
+            replacement: text.clone().into(),
         });
         self.saved_text = text;
         self.saved_version = self.text.snapshot().version();
@@ -239,7 +239,7 @@ mod tests {
         buffer
             .edit(TextEdit {
                 range: 0..0,
-                replacement: "// hi\n".to_string(),
+                replacement: "// hi\n".to_string().into(),
             })
             .unwrap();
         assert!(buffer.snapshot().is_dirty());
@@ -258,7 +258,7 @@ mod tests {
         buffer
             .edit(TextEdit {
                 range: 5..5,
-                replacement: " zed".to_string(),
+                replacement: " zed".to_string().into(),
             })
             .unwrap();
         assert!(buffer.snapshot().is_dirty());
@@ -283,7 +283,7 @@ mod tests {
         buffer
             .edit(TextEdit {
                 range: 6..11,
-                replacement: "zed".to_string(),
+                replacement: "zed".to_string().into(),
             })
             .unwrap();
         assert_eq!(buffer.snapshot().text.text(), "hello zed");
@@ -337,7 +337,7 @@ mod tests {
         buffer
             .edit(TextEdit {
                 range: 6..11,
-                replacement: "zed".to_string(),
+                replacement: "zed".to_string().into(),
             })
             .unwrap();
 
