@@ -228,6 +228,89 @@ impl EditorModel {
         self.set_selections(normalize_new_selections(selections));
     }
 
+    pub fn select_display_rectangle(
+        &mut self,
+        anchor_row: usize,
+        anchor_column: usize,
+        head_row: usize,
+        head_column: usize,
+        soft_wrap_column: Option<usize>,
+    ) {
+        let display = self.display_snapshot(soft_wrap_column);
+        let row_start = anchor_row.min(head_row);
+        let row_end = anchor_row.max(head_row);
+        let column_start = anchor_column.min(head_column);
+        let column_end = anchor_column.max(head_column);
+        let ranges = display
+            .rows()
+            .iter()
+            .filter(|row| row.row >= row_start && row.row <= row_end)
+            .map(|row| {
+                let start = display.source_offset_for_display_point(DisplayPoint {
+                    row: row.row,
+                    column: column_start,
+                });
+                let end = display.source_offset_for_display_point(DisplayPoint {
+                    row: row.row,
+                    column: column_end,
+                });
+                start..end
+            })
+            .collect();
+        self.select_ranges(ranges);
+    }
+
+    pub fn add_caret_at_display_point(
+        &mut self,
+        row: usize,
+        column: usize,
+        soft_wrap_column: Option<usize>,
+    ) {
+        let display = self.display_snapshot(soft_wrap_column);
+        let offset = display.source_offset_for_display_point(DisplayPoint { row, column });
+        self.add_caret(offset);
+    }
+
+    pub fn add_caret_above(&mut self, soft_wrap_column: Option<usize>) -> Result<(), String> {
+        self.add_caret_vertically(-1, soft_wrap_column)
+    }
+
+    pub fn add_caret_below(&mut self, soft_wrap_column: Option<usize>) -> Result<(), String> {
+        self.add_caret_vertically(1, soft_wrap_column)
+    }
+
+    pub fn add_caret(&mut self, offset: usize) {
+        let text = self.snapshot().text().to_string();
+        let offset = floor_char_boundary(&text, offset);
+        let mut selections = self.resolved_selections();
+        selections.push(Selection::caret(offset));
+        let normalized = normalize_new_selections(selections);
+        let active_selection_index = normalized
+            .iter()
+            .position(|selection| selection.is_empty() && selection.head() == offset)
+            .or_else(|| {
+                normalized
+                    .iter()
+                    .position(|selection| selection.start <= offset && offset <= selection.end)
+            })
+            .unwrap_or_else(|| normalized.len().saturating_sub(1));
+        self.set_selections_with_active_index(normalized, active_selection_index);
+    }
+
+    fn add_caret_vertically(
+        &mut self,
+        row_delta: isize,
+        soft_wrap_column: Option<usize>,
+    ) -> Result<(), String> {
+        let selection = self.active_selection()?;
+        let display = self.display_snapshot(soft_wrap_column);
+        let point = display.display_point_for_source_offset(selection.head());
+        let target =
+            display.source_offset_for_vertical_movement(selection.head(), row_delta, point.column);
+        self.add_caret(target);
+        Ok(())
+    }
+
     pub fn cursor_offset(&self) -> Result<usize, String> {
         Ok(self.active_selection()?.head())
     }
@@ -392,6 +475,141 @@ impl EditorModel {
         self.select(range);
     }
 
+    pub fn select_next_match(&mut self) -> bool {
+        let text = self.snapshot().text().to_string();
+        let mut selections = self.resolved_selections();
+        let Some(active_selection) = selections.get(self.active_selection_index).cloned() else {
+            return false;
+        };
+
+        if active_selection.is_empty() {
+            let range = word_range_at_offset(&text, active_selection.head());
+            if range.is_empty() {
+                return false;
+            }
+            self.select(range);
+            return true;
+        }
+
+        let query = &text[active_selection.range()];
+        if query.is_empty() {
+            return false;
+        }
+
+        let search_start = selections
+            .iter()
+            .map(|selection| selection.end)
+            .max()
+            .unwrap_or(active_selection.end);
+        let Some(next_range) =
+            find_next_non_overlapping_match(&text, query, search_start, &selections)
+        else {
+            return false;
+        };
+
+        selections.push(Selection::from_anchor_head(
+            selections.len(),
+            next_range.start,
+            next_range.end,
+        ));
+        let normalized = normalize_new_selections(selections);
+        let active_selection_index = normalized
+            .iter()
+            .position(|selection| {
+                selection.start == next_range.start && selection.end == next_range.end
+            })
+            .unwrap_or_else(|| normalized.len().saturating_sub(1));
+        self.set_selections_with_active_index(normalized, active_selection_index);
+        true
+    }
+
+    pub fn select_all_matches(&mut self) -> bool {
+        let text = self.snapshot().text().to_string();
+        let Some(active_selection) = self
+            .resolved_selections()
+            .get(self.active_selection_index)
+            .cloned()
+        else {
+            return false;
+        };
+        let range = if active_selection.is_empty() {
+            word_range_at_offset(&text, active_selection.head())
+        } else {
+            active_selection.range()
+        };
+        if range.is_empty() {
+            return false;
+        }
+
+        let query = &text[range.clone()];
+        let matches = find_all_non_overlapping_matches(&text, query);
+        if matches.is_empty() {
+            return false;
+        }
+
+        let selections = matches
+            .into_iter()
+            .enumerate()
+            .map(|(id, range)| Selection::from_anchor_head(id, range.start, range.end))
+            .collect::<Vec<_>>();
+        let active_selection_index = selections
+            .iter()
+            .position(|selection| selection.start == range.start && selection.end == range.end)
+            .unwrap_or_else(|| selections.len().saturating_sub(1));
+        self.set_selections_with_active_index(selections, active_selection_index);
+        true
+    }
+
+    pub fn skip_active_match(&mut self) -> bool {
+        let text = self.snapshot().text().to_string();
+        let mut selections = self.resolved_selections();
+        let Some(active_selection) = selections.get(self.active_selection_index).cloned() else {
+            return false;
+        };
+        if active_selection.is_empty() {
+            return false;
+        }
+
+        let query = &text[active_selection.range()];
+        if query.is_empty() {
+            return false;
+        }
+
+        selections.remove(self.active_selection_index);
+        let mut blocked_matches = selections.clone();
+        blocked_matches.push(active_selection.clone());
+        if let Some(next_range) =
+            find_next_non_overlapping_match(&text, query, active_selection.end, &blocked_matches)
+        {
+            selections.push(Selection::from_anchor_head(
+                selections.len(),
+                next_range.start,
+                next_range.end,
+            ));
+            let normalized = normalize_new_selections(selections);
+            let active_selection_index = normalized
+                .iter()
+                .position(|selection| {
+                    selection.start == next_range.start && selection.end == next_range.end
+                })
+                .unwrap_or_else(|| normalized.len().saturating_sub(1));
+            self.set_selections_with_active_index(normalized, active_selection_index);
+            return true;
+        }
+
+        if selections.is_empty() {
+            self.select(active_selection.head()..active_selection.head());
+            return true;
+        }
+
+        let active_selection_index = selections
+            .iter()
+            .position(|selection| selection.start >= active_selection.end)
+            .unwrap_or_else(|| selections.len().saturating_sub(1));
+        self.set_selections_with_active_index(selections, active_selection_index);
+        true
+    }
+
     pub fn selected_text(&self) -> String {
         let text = self.snapshot().text().to_string();
         self.resolved_selections()
@@ -446,16 +664,39 @@ impl EditorModel {
 
     pub fn insert_text(&mut self, text: impl Into<String>) -> Result<(), String> {
         let replacement: Rc<str> = text.into().into();
+        let selection_count = self.resolved_selections().len();
+        self.insert_rc_texts(vec![replacement; selection_count])
+    }
+
+    pub fn insert_texts(&mut self, replacements: Vec<String>) -> Result<(), String> {
+        let replacements = replacements
+            .into_iter()
+            .map(Rc::<str>::from)
+            .collect::<Vec<_>>();
+        self.insert_rc_texts(replacements)
+    }
+
+    fn insert_rc_texts(&mut self, replacements: Vec<Rc<str>>) -> Result<(), String> {
         let selections = self.resolved_selections();
+        if replacements.len() != selections.len() {
+            return Err(format!(
+                "replacement count {} does not match selection count {}",
+                replacements.len(),
+                selections.len()
+            ));
+        }
         let undo_selections = selections.clone();
         let undo_active_selection_index = self.active_selection_index;
         let sorted_selections = sorted_non_overlapping_selections(&selections)?;
-        let replacement_len = isize::try_from(replacement.len())
-            .map_err(|_| "replacement text is too large".to_string())?;
         let mut next_selections = selections;
         let mut delta = 0isize;
 
         for selection in &sorted_selections {
+            let replacement = replacements
+                .get(selection.selection_index)
+                .ok_or_else(|| "missing replacement for selection".to_string())?;
+            let replacement_len = isize::try_from(replacement.len())
+                .map_err(|_| "replacement text is too large".to_string())?;
             let start = selection
                 .start
                 .checked_add_signed(delta)
@@ -482,7 +723,7 @@ impl EditorModel {
                 .rev()
                 .map(|selection| MultiBufferEdit {
                     range: selection.range.clone(),
-                    replacement: replacement.clone(),
+                    replacement: replacements[selection.selection_index].clone(),
                 })
                 .collect(),
         )?;
@@ -1030,6 +1271,72 @@ fn line_range_at_offset(text: &str, offset: usize) -> Range<usize> {
     start..end
 }
 
+fn find_next_non_overlapping_match(
+    text: &str,
+    query: &str,
+    search_start: usize,
+    selections: &[Selection],
+) -> Option<Range<usize>> {
+    find_non_overlapping_match(text, query, search_start, text.len(), selections)
+        .or_else(|| find_non_overlapping_match(text, query, 0, search_start, selections))
+}
+
+fn find_non_overlapping_match(
+    text: &str,
+    query: &str,
+    start: usize,
+    end: usize,
+    selections: &[Selection],
+) -> Option<Range<usize>> {
+    if start >= end {
+        return None;
+    }
+
+    let mut cursor = floor_char_boundary(text, start);
+    let end = floor_char_boundary(text, end);
+    while cursor < end {
+        let haystack = &text[cursor..end];
+        let Some(relative_offset) = haystack.find(query) else {
+            return None;
+        };
+        let match_start = cursor + relative_offset;
+        let match_end = match_start + query.len();
+        let range = match_start..match_end;
+        if !selections
+            .iter()
+            .any(|selection| selection.start == range.start && selection.end == range.end)
+            && !selections
+                .iter()
+                .any(|selection| selection.start < range.end && range.start < selection.end)
+        {
+            return Some(range);
+        }
+        cursor = next_char_boundary(text, match_start);
+    }
+
+    None
+}
+
+fn find_all_non_overlapping_matches(text: &str, query: &str) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let haystack = &text[cursor..];
+        let Some(relative_offset) = haystack.find(query) else {
+            break;
+        };
+        let match_start = cursor + relative_offset;
+        let match_end = match_start + query.len();
+        ranges.push(match_start..match_end);
+        cursor = match_end;
+    }
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,6 +1680,228 @@ mod tests {
     }
 
     #[test]
+    fn select_display_rectangle_selects_ranges_per_display_row() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd\nef\nghij");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_display_rectangle(0, 1, 2, 3, None);
+
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![1..3, 6..7, 9..11]
+        );
+        assert_eq!(editor.active_selection_index(), 2);
+        assert_eq!(editor.selected_text(), "bcfhi");
+    }
+
+    #[test]
+    fn select_next_match_selects_current_word_then_adds_matches() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "foo bar foo foo");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(1..1);
+        assert!(editor.select_next_match());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+
+        assert!(editor.select_next_match());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 8..11]
+        );
+        assert_eq!(editor.active_selection_index(), 1);
+
+        assert!(editor.select_next_match());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 8..11, 12..15]
+        );
+        assert_eq!(editor.active_selection_index(), 2);
+        assert_eq!(editor.selected_text(), "foofoofoo");
+
+        assert!(!editor.select_next_match());
+    }
+
+    #[test]
+    fn select_next_match_wraps_to_earlier_non_overlapping_match() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "foo bar foo foo");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_ranges(vec![8..11, 12..15]);
+
+        assert!(editor.select_next_match());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 8..11, 12..15]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+    }
+
+    #[test]
+    fn select_all_matches_selects_every_current_word_match() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "foo bar foo foo");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(9..9);
+
+        assert!(editor.select_all_matches());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 8..11, 12..15]
+        );
+        assert_eq!(editor.active_selection_index(), 1);
+        assert_eq!(editor.selected_text(), "foofoofoo");
+    }
+
+    #[test]
+    fn select_all_matches_uses_active_selected_text() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "aba ab aba");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(1..3);
+
+        assert!(editor.select_all_matches());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![1..3, 8..10]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+        assert_eq!(editor.selected_text(), "baba");
+    }
+
+    #[test]
+    fn skip_active_match_removes_active_and_adds_next_unselected_match() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "foo foo foo foo");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_ranges(vec![0..3, 4..7]);
+        editor.set_active_selection_index(0).unwrap();
+
+        assert!(editor.skip_active_match());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![4..7, 8..11]
+        );
+        assert_eq!(editor.active_selection_index(), 1);
+        assert_eq!(editor.selected_text(), "foofoo");
+    }
+
+    #[test]
+    fn skip_active_match_removes_active_when_no_unselected_match_remains() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "foo bar foo");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_ranges(vec![0..3, 8..11]);
+        editor.set_active_selection_index(1).unwrap();
+
+        assert!(editor.skip_active_match());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+        assert_eq!(editor.selected_text(), "foo");
+    }
+
+    #[test]
+    fn add_caret_at_display_point_adds_or_activates_caret() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\ndef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.add_caret_at_display_point(1, 2, None);
+
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..0, 6..6]
+        );
+        assert_eq!(editor.active_selection_index(), 1);
+
+        editor.add_caret_at_display_point(0, 0, None);
+
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..0, 6..6]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+    }
+
+    #[test]
+    fn add_caret_above_and_below_use_current_display_column() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd\nef\nghij");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(6..6);
+        editor.add_caret_below(None).unwrap();
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![6..6, 9..9]
+        );
+        assert_eq!(editor.active_selection_index(), 1);
+
+        editor.add_caret_above(None).unwrap();
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![6..6, 9..9]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+    }
+
+    #[test]
     fn select_word_at_display_point_uses_word_boundaries() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "one, two_é");
         let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
@@ -1579,6 +2108,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1..1, 7..7]
         );
+    }
+
+    #[test]
+    fn insertion_can_use_one_replacement_per_selection() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        editor
+            .insert_texts(vec!["alpha".to_string(), "omega".to_string()])
+            .unwrap();
+
+        assert_eq!(editor.snapshot().text(), "alpha two omega");
+        assert_eq!(editor.active_selection_index(), 1);
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![5..5, 15..15]
+        );
+        assert_eq!(editor.cursor_offset().unwrap(), 15);
+    }
+
+    #[test]
+    fn insertion_rejects_replacement_count_mismatch() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        let error = editor.insert_texts(vec!["alpha".to_string()]).unwrap_err();
+
+        assert!(error.contains("replacement count"));
+        assert_eq!(editor.snapshot().text(), "one two three");
     }
 
     #[test]
