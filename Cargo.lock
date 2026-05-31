@@ -3093,6 +3093,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mini_app"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "language",
+ "text",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
