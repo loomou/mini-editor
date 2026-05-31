@@ -4,8 +4,9 @@ use std::ops::Range;
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
     Entity, FocusHandle, GlobalElementId, InspectorElementId, IntoElement, KeyDownEvent, Keystroke,
-    LayoutId, Modifiers, MouseButton, MouseDownEvent, Pixels, Point, Render, Style, UTF16Selection,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    Render, ScrollDelta, ScrollWheelEvent, Style, UTF16Selection, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, rgb, size,
 };
 
 const DEFAULT_SOFT_WRAP_COLUMN: usize = 100;
@@ -14,13 +15,18 @@ const HEADER_HEIGHT: Pixels = px(28.0);
 const LINE_HEIGHT: Pixels = px(20.0);
 const LINE_NUMBER_WIDTH: Pixels = px(48.0);
 const CONTENT_GAP: Pixels = px(12.0);
-const CHARACTER_WIDTH: Pixels = px(8.0);
+const DISPLAY_COLUMN_WIDTH: Pixels = px(8.0);
+const CARET_WIDTH: Pixels = px(2.0);
+const DEFAULT_VIEWPORT_ROWS: usize = 20;
 
 #[derive(Debug)]
 pub struct EditorView {
     editor: EditorModel,
     focus_handle: Option<FocusHandle>,
     marked_range: Option<Range<usize>>,
+    selecting_with_mouse: bool,
+    viewport_start_row: usize,
+    viewport_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +47,10 @@ pub enum EditorCommand {
     MoveToDocumentEnd { extend: bool },
     MoveToPreviousWord { extend: bool },
     MoveToNextWord { extend: bool },
+    PageUp { extend: bool },
+    PageDown { extend: bool },
+    ScrollUp,
+    ScrollDown,
     SelectAll,
     Copy,
     Cut,
@@ -90,6 +100,14 @@ pub struct RenderedLine {
     pub selection_ranges: Vec<Range<usize>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedLineFragment {
+    pub text: String,
+    pub selected: bool,
+    pub cursor: bool,
+    pub active_cursor: bool,
+}
+
 impl RenderedLine {
     pub fn text_with_cursors(&self) -> String {
         let mut text = self.text.clone();
@@ -98,8 +116,8 @@ impl RenderedLine {
         cursor_columns.dedup();
 
         for column in cursor_columns.into_iter().rev() {
-            if column <= text.len() && text.is_char_boundary(column) {
-                text.insert(column, '|');
+            if let Some(byte_offset) = byte_offset_for_display_column(&text, column) {
+                text.insert(byte_offset, '|');
             }
         }
 
@@ -126,13 +144,117 @@ impl RenderedLine {
         });
 
         for (column, marker) in markers {
-            if column <= text.len() && text.is_char_boundary(column) {
-                text.insert(column, marker);
+            if let Some(byte_offset) = byte_offset_for_display_column(&text, column) {
+                text.insert(byte_offset, marker);
             }
         }
 
         text
     }
+
+    pub fn visual_fragments(&self) -> Vec<RenderedLineFragment> {
+        let text_column_count = self.text.chars().count();
+        let mut boundaries = vec![0, text_column_count];
+
+        for range in &self.selection_ranges {
+            if range.start <= text_column_count {
+                boundaries.push(range.start);
+            }
+            if range.end <= text_column_count {
+                boundaries.push(range.end);
+            }
+        }
+        for column in &self.cursor_columns {
+            if *column <= text_column_count {
+                boundaries.push(*column);
+            }
+        }
+
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        let mut fragments = Vec::new();
+        for window in boundaries.windows(2) {
+            let start_column = window[0];
+            let end_column = window[1];
+            let Some(start_byte) = byte_offset_for_display_column(&self.text, start_column) else {
+                continue;
+            };
+            let Some(end_byte) = byte_offset_for_display_column(&self.text, end_column) else {
+                continue;
+            };
+
+            self.push_cursor_fragment(start_column, &mut fragments);
+
+            if start_byte < end_byte {
+                fragments.push(RenderedLineFragment {
+                    text: self.text[start_byte..end_byte].to_string(),
+                    selected: self.range_is_selected(start_column..end_column),
+                    cursor: false,
+                    active_cursor: false,
+                });
+            }
+        }
+
+        self.push_cursor_fragment(text_column_count, &mut fragments);
+
+        if fragments.is_empty() {
+            fragments.push(RenderedLineFragment {
+                text: String::new(),
+                selected: false,
+                cursor: false,
+                active_cursor: false,
+            });
+        }
+
+        fragments
+    }
+
+    fn push_cursor_fragment(&self, column: usize, fragments: &mut Vec<RenderedLineFragment>) {
+        let cursor_count = self
+            .cursor_columns
+            .iter()
+            .filter(|cursor| **cursor == column)
+            .count();
+        if cursor_count == 0 {
+            return;
+        }
+
+        let active_cursor = self
+            .active_cursor_columns
+            .iter()
+            .any(|cursor| *cursor == column);
+        for cursor_index in 0..cursor_count {
+            fragments.push(RenderedLineFragment {
+                text: String::new(),
+                selected: false,
+                cursor: true,
+                active_cursor: active_cursor && cursor_index == 0,
+            });
+        }
+    }
+
+    fn range_is_selected(&self, range: Range<usize>) -> bool {
+        self.selection_ranges
+            .iter()
+            .any(|selection| selection.start < range.end && selection.end > range.start)
+    }
+}
+
+fn byte_offset_for_display_column(text: &str, display_column: usize) -> Option<usize> {
+    if display_column == text.chars().count() {
+        return Some(text.len());
+    }
+
+    text.char_indices()
+        .nth(display_column)
+        .map(|(offset, _)| offset)
+}
+
+fn display_column_for_byte_offset(text: &str, byte_offset: usize) -> usize {
+    text.char_indices()
+        .take_while(|(offset, _)| *offset < byte_offset)
+        .count()
 }
 
 impl EditorView {
@@ -141,6 +263,9 @@ impl EditorView {
             editor,
             focus_handle: None,
             marked_range: None,
+            selecting_with_mouse: false,
+            viewport_start_row: 0,
+            viewport_rows: DEFAULT_VIEWPORT_ROWS,
         }
     }
 
@@ -149,13 +274,22 @@ impl EditorView {
             editor,
             focus_handle: Some(focus_handle),
             marked_range: None,
+            selecting_with_mouse: false,
+            viewport_start_row: 0,
+            viewport_rows: DEFAULT_VIEWPORT_ROWS,
         }
+    }
+
+    pub fn with_viewport_rows(mut self, viewport_rows: usize) -> Self {
+        self.viewport_rows = viewport_rows.max(1);
+        self
     }
 
     pub fn dispatch_command(&mut self, command: EditorCommand) -> Result<CommandOutcome, String> {
         let before_text = self.editor.snapshot().text().to_string();
         let before_selections = selection_state(&self.editor);
 
+        let mut reveal_cursor = true;
         match command {
             EditorCommand::InsertChar(character) => self.editor.insert_char(character)?,
             EditorCommand::InsertText(text) => self.editor.insert_text(text)?,
@@ -201,10 +335,23 @@ impl EditorView {
             EditorCommand::MoveToNextWord { extend } => {
                 self.editor.move_to_next_word(extend)?;
             }
+            EditorCommand::PageUp { extend } => self.move_page(-1, extend)?,
+            EditorCommand::PageDown { extend } => self.move_page(1, extend)?,
+            EditorCommand::ScrollUp => {
+                self.scroll_viewport(-1);
+                reveal_cursor = false;
+            }
+            EditorCommand::ScrollDown => {
+                self.scroll_viewport(1);
+                reveal_cursor = false;
+            }
             EditorCommand::SelectAll => self.editor.select_all(),
             EditorCommand::Copy | EditorCommand::Cut | EditorCommand::Paste => {}
         }
 
+        if reveal_cursor {
+            self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
+        }
         let after_text = self.editor.snapshot().text().to_string();
         let after_selections = selection_state(&self.editor);
         Ok(CommandOutcome {
@@ -214,11 +361,7 @@ impl EditorView {
     }
 
     pub fn text(&self) -> String {
-        self.rendered_lines(None)
-            .into_iter()
-            .map(|line| line.text)
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.editor.snapshot().text().to_string()
     }
 
     pub fn rendered_editor(&self, soft_wrap_column: Option<usize>) -> RenderedEditor {
@@ -233,6 +376,11 @@ impl EditorView {
 
     pub fn refresh_buffer_ranges(&mut self) {
         self.editor.refresh_buffer_ranges();
+        self.clamp_viewport(Some(DEFAULT_SOFT_WRAP_COLUMN));
+    }
+
+    pub fn viewport_start_row(&self) -> usize {
+        self.viewport_start_row
     }
 
     fn handle_key_down(
@@ -262,18 +410,100 @@ impl EditorView {
             focus_handle.focus(window);
         }
 
-        let (row, column) = display_point_for_mouse_position(event.position);
-        match self.editor.select_display_point(
-            row,
-            column,
-            event.modifiers.shift,
-            Some(DEFAULT_SOFT_WRAP_COLUMN),
-        ) {
+        let (row, column) = self.display_point_for_mouse_position(event.position);
+        let result = match event.click_count {
+            3.. => {
+                self.selecting_with_mouse = false;
+                self.editor.select_line_at_display_point(
+                    row,
+                    column,
+                    Some(DEFAULT_SOFT_WRAP_COLUMN),
+                );
+                Ok(())
+            }
+            2 => {
+                self.selecting_with_mouse = false;
+                self.editor.select_word_at_display_point(
+                    row,
+                    column,
+                    Some(DEFAULT_SOFT_WRAP_COLUMN),
+                );
+                Ok(())
+            }
+            _ => {
+                self.selecting_with_mouse = true;
+                self.editor.select_display_point(
+                    row,
+                    column,
+                    event.modifiers.shift,
+                    Some(DEFAULT_SOFT_WRAP_COLUMN),
+                )
+            }
+        };
+
+        match result {
             Ok(()) => {
+                self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
                 cx.notify();
                 cx.stop_propagation();
             }
             Err(error) => eprintln!("mini_ui mouse selection failed: {error}"),
+        }
+    }
+
+    fn handle_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selecting_with_mouse {
+            return;
+        }
+
+        let (row, column) = self.display_point_for_drag_position(event.position);
+        match self
+            .editor
+            .select_display_point(row, column, true, Some(DEFAULT_SOFT_WRAP_COLUMN))
+        {
+            Ok(()) => {
+                self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Err(error) => eprintln!("mini_ui mouse drag selection failed: {error}"),
+        }
+    }
+
+    fn handle_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = scroll_rows_for_delta(event.delta);
+        if rows == 0 {
+            return;
+        }
+
+        let before = self.viewport_start_row;
+        self.scroll_viewport_by_rows(rows);
+        if self.viewport_start_row != before {
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    fn handle_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selecting_with_mouse {
+            self.selecting_with_mouse = false;
+            cx.notify();
+            cx.stop_propagation();
         }
     }
 
@@ -296,6 +526,84 @@ impl EditorView {
             }
             command => self.dispatch_command(command),
         }
+    }
+
+    fn move_page(&mut self, direction: isize, extend: bool) -> Result<(), String> {
+        let page_rows = self.viewport_rows.max(1);
+        for _ in 0..page_rows {
+            if direction < 0 {
+                self.editor
+                    .move_up(extend, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
+            } else {
+                self.editor
+                    .move_down(extend, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
+            }
+        }
+        self.scroll_viewport(direction);
+        Ok(())
+    }
+
+    fn scroll_viewport(&mut self, direction: isize) {
+        let page_rows = self.viewport_rows.max(1);
+        self.scroll_viewport_by_rows(direction.saturating_mul(page_rows as isize));
+    }
+
+    fn scroll_viewport_by_rows(&mut self, rows: isize) {
+        self.viewport_start_row = self.viewport_start_row.saturating_add_signed(rows);
+        self.clamp_viewport(Some(DEFAULT_SOFT_WRAP_COLUMN));
+    }
+
+    fn reveal_active_cursor(&mut self, soft_wrap_column: Option<usize>) {
+        let Ok(cursor) = self.editor.cursor_display_point(soft_wrap_column) else {
+            return;
+        };
+        if cursor.row < self.viewport_start_row {
+            self.viewport_start_row = cursor.row;
+        } else {
+            let viewport_end = self.viewport_start_row + self.viewport_rows.max(1);
+            if cursor.row >= viewport_end {
+                self.viewport_start_row = cursor.row + 1 - self.viewport_rows.max(1);
+            }
+        }
+        self.clamp_viewport(soft_wrap_column);
+    }
+
+    fn clamp_viewport(&mut self, soft_wrap_column: Option<usize>) {
+        let row_count = self.editor.display_snapshot(soft_wrap_column).rows().len();
+        let max_start = row_count.saturating_sub(self.viewport_rows.max(1));
+        self.viewport_start_row = self.viewport_start_row.min(max_start);
+    }
+
+    fn display_point_for_mouse_position(&self, position: Point<Pixels>) -> (usize, usize) {
+        let (visible_row, display_column) = visible_display_point_for_mouse_position(position);
+        (self.viewport_start_row + visible_row, display_column)
+    }
+
+    fn utf8_offset_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+        let (row, display_column) = self.display_point_for_mouse_position(position);
+        self.editor.source_offset_for_display_point(
+            row,
+            display_column,
+            Some(DEFAULT_SOFT_WRAP_COLUMN),
+        )
+    }
+
+    fn display_point_for_drag_position(&mut self, position: Point<Pixels>) -> (usize, usize) {
+        let (visible_row, display_column) = visible_display_point_for_mouse_position(position);
+        let viewport_rows = self.viewport_rows.max(1);
+
+        let row_origin = EDITOR_PADDING + HEADER_HEIGHT;
+        if position.y < row_origin {
+            self.scroll_viewport_by_rows(-1);
+            return (self.viewport_start_row, display_column);
+        }
+
+        if visible_row >= viewport_rows {
+            self.scroll_viewport_by_rows(1);
+            return (self.viewport_start_row + viewport_rows - 1, display_column);
+        }
+
+        (self.viewport_start_row + visible_row, display_column)
     }
 
     fn dispatch_paste_text(&mut self, text: &str) -> Result<CommandOutcome, String> {
@@ -397,6 +705,8 @@ impl EditorView {
         display
             .rows()
             .iter()
+            .skip(self.viewport_start_row)
+            .take(self.viewport_rows.max(1))
             .map(|row| RenderedLine {
                 line_number: row.row + 1,
                 text: row.text.clone(),
@@ -421,8 +731,16 @@ impl EditorView {
                         }
                         let start = selection.start.max(row.source_range.start);
                         let end = selection.end.min(row.source_range.end);
-                        (start < end)
-                            .then_some(start - row.source_range.start..end - row.source_range.start)
+                        (start < end).then_some(
+                            display_column_for_byte_offset(
+                                &row.text,
+                                start - row.source_range.start,
+                            )
+                                ..display_column_for_byte_offset(
+                                    &row.text,
+                                    end - row.source_range.start,
+                                ),
+                        )
                     })
                     .collect(),
             })
@@ -507,7 +825,7 @@ fn availability_label(available: bool) -> &'static str {
     if available { "on" } else { "off" }
 }
 
-fn display_point_for_mouse_position(position: Point<Pixels>) -> (usize, usize) {
+fn visible_display_point_for_mouse_position(position: Point<Pixels>) -> (usize, usize) {
     let row_origin = EDITOR_PADDING + HEADER_HEIGHT;
     let column_origin = EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP;
     let row = if position.y <= row_origin {
@@ -518,9 +836,27 @@ fn display_point_for_mouse_position(position: Point<Pixels>) -> (usize, usize) {
     let column = if position.x <= column_origin {
         0
     } else {
-        ((position.x - column_origin) / CHARACTER_WIDTH).round() as usize
+        ((position.x - column_origin) / DISPLAY_COLUMN_WIDTH).round() as usize
     };
     (row, column)
+}
+
+fn scroll_rows_for_delta(delta: ScrollDelta) -> isize {
+    let rows = match delta {
+        ScrollDelta::Lines(delta) => delta.y,
+        ScrollDelta::Pixels(delta) => delta.y / LINE_HEIGHT,
+    };
+
+    if rows == 0.0 {
+        return 0;
+    }
+
+    let row_count = rows.abs().ceil() as isize;
+    if rows.is_sign_positive() {
+        -row_count
+    } else {
+        row_count
+    }
 }
 
 fn selection_state(editor: &EditorModel) -> Vec<(usize, usize, usize, bool)> {
@@ -562,6 +898,12 @@ fn command_for_keystroke(keystroke: &Keystroke) -> Option<EditorCommand> {
             extend: modifiers.shift,
         }),
         "down" if navigation_modifiers(modifiers) => Some(EditorCommand::MoveDown {
+            extend: modifiers.shift,
+        }),
+        "pageup" if navigation_modifiers(modifiers) => Some(EditorCommand::PageUp {
+            extend: modifiers.shift,
+        }),
+        "pagedown" if navigation_modifiers(modifiers) => Some(EditorCommand::PageDown {
             extend: modifiers.shift,
         }),
         "home" if document_modifiers(modifiers) => Some(EditorCommand::MoveToDocumentStart {
@@ -760,11 +1102,13 @@ impl gpui::EntityInputHandler for EditorView {
 
     fn character_index_for_point(
         &mut self,
-        _point: gpui::Point<Pixels>,
+        point: gpui::Point<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        None
+        let text = self.editor.snapshot().text().to_string();
+        let offset = self.utf8_offset_for_mouse_position(point);
+        Some(utf8_offset_to_utf16(&text, offset))
     }
 }
 
@@ -781,6 +1125,9 @@ impl Render for EditorView {
             .track_focus(&focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
             .child(EditorInputElement {
                 view: cx.entity(),
                 focus_handle: focus_handle.clone(),
@@ -802,6 +1149,8 @@ impl Render for EditorView {
                 div()
                     .flex()
                     .gap_3()
+                    .h(LINE_HEIGHT)
+                    .items_center()
                     .child(div().w(px(48.0)).text_color(rgb(0x6e7681)).child(
                         if line.continuation {
                             "...".to_string()
@@ -809,8 +1158,41 @@ impl Render for EditorView {
                             line.line_number.to_string()
                         },
                     ))
-                    .child(div().child(line.text_with_overlays()))
+                    .child(render_visual_line(line))
             }))
+    }
+}
+
+fn render_visual_line(line: RenderedLine) -> impl IntoElement {
+    div().flex().items_center().children(
+        line.visual_fragments()
+            .into_iter()
+            .map(render_line_fragment),
+    )
+}
+
+fn render_line_fragment(fragment: RenderedLineFragment) -> impl IntoElement {
+    if fragment.cursor {
+        div()
+            .w(CARET_WIDTH)
+            .h(LINE_HEIGHT)
+            .bg(if fragment.active_cursor {
+                rgb(0xf0f6fc)
+            } else {
+                rgb(0x8b949e)
+            })
+            .into_any_element()
+    } else {
+        div()
+            .h(LINE_HEIGHT)
+            .px(px(1.0))
+            .bg(if fragment.selected {
+                rgb(0x264f78)
+            } else {
+                rgb(0x1f2328)
+            })
+            .child(fragment.text)
+            .into_any_element()
     }
 }
 
@@ -987,6 +1369,54 @@ mod tests {
         assert_eq!(lines[1].selection_ranges, vec![0..1]);
         assert_eq!(lines[0].text_with_overlays(), "a[bc]");
         assert_eq!(lines[1].text_with_overlays(), "[d]|ef");
+    }
+
+    #[test]
+    fn rendered_line_builds_visual_fragments_for_selection_and_cursors() {
+        let line = RenderedLine {
+            line_number: 1,
+            text: "abcd".to_string(),
+            continuation: false,
+            cursor_columns: vec![1, 3],
+            active_cursor_columns: vec![3],
+            selection_ranges: vec![1..3],
+        };
+
+        assert_eq!(
+            line.visual_fragments(),
+            vec![
+                RenderedLineFragment {
+                    text: "a".to_string(),
+                    selected: false,
+                    cursor: false,
+                    active_cursor: false,
+                },
+                RenderedLineFragment {
+                    text: String::new(),
+                    selected: false,
+                    cursor: true,
+                    active_cursor: false,
+                },
+                RenderedLineFragment {
+                    text: "bc".to_string(),
+                    selected: true,
+                    cursor: false,
+                    active_cursor: false,
+                },
+                RenderedLineFragment {
+                    text: String::new(),
+                    selected: false,
+                    cursor: true,
+                    active_cursor: true,
+                },
+                RenderedLineFragment {
+                    text: "d".to_string(),
+                    selected: false,
+                    cursor: false,
+                    active_cursor: false,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1174,6 +1604,97 @@ mod tests {
     }
 
     #[test]
+    fn view_renders_only_visible_viewport_rows() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(2);
+
+        assert_eq!(
+            view.rendered_lines(None)
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>(),
+            vec!["0".to_string(), "1".to_string()]
+        );
+        assert_eq!(view.text(), "0\n1\n2\n3\n4");
+
+        view.dispatch_command(EditorCommand::ScrollDown).unwrap();
+        assert_eq!(view.viewport_start_row(), 2);
+        assert_eq!(
+            view.rendered_lines(None)
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>(),
+            vec!["2".to_string(), "3".to_string()]
+        );
+
+        view.dispatch_command(EditorCommand::ScrollDown).unwrap();
+        assert_eq!(view.viewport_start_row(), 3);
+        assert_eq!(
+            view.rendered_lines(None)
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>(),
+            vec!["3".to_string(), "4".to_string()]
+        );
+    }
+
+    #[test]
+    fn view_dispatches_page_up_down_and_reveals_cursor() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4\n5").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(2);
+
+        view.dispatch_command(EditorCommand::PageDown { extend: false })
+            .unwrap();
+        assert_eq!(view.viewport_start_row(), 2);
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|2");
+
+        view.dispatch_command(EditorCommand::PageDown { extend: true })
+            .unwrap();
+        assert_eq!(view.viewport_start_row(), 4);
+        assert_eq!(view.editor.selected_text(), "2\n3\n");
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|4");
+
+        view.dispatch_command(EditorCommand::PageUp { extend: false })
+            .unwrap();
+        assert_eq!(view.viewport_start_row(), 2);
+        assert!(view.editor.selected_text().is_empty());
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|2");
+    }
+
+    #[test]
+    fn drag_beyond_viewport_autoscrolls_and_extends_selection() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(2);
+
+        view.editor
+            .select_display_point(1, 0, false, Some(DEFAULT_SOFT_WRAP_COLUMN))
+            .unwrap();
+        view.selecting_with_mouse = true;
+
+        let (row, column) = view.display_point_for_drag_position(Point {
+            x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+            y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 3,
+        });
+        view.editor
+            .select_display_point(row, column, true, Some(DEFAULT_SOFT_WRAP_COLUMN))
+            .unwrap();
+
+        assert_eq!(view.viewport_start_row(), 1);
+        assert_eq!(view.editor.selected_text(), "1\n");
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[1]");
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|2");
+    }
+
+    #[test]
     fn view_dispatches_line_document_and_word_navigation_commands() {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -1264,6 +1785,14 @@ mod tests {
             Some(EditorCommand::MoveDown { extend: true })
         );
         assert_eq!(
+            command_for_keystroke(&Keystroke::parse("pageup").unwrap()),
+            Some(EditorCommand::PageUp { extend: false })
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("shift-pagedown").unwrap()),
+            Some(EditorCommand::PageDown { extend: true })
+        );
+        assert_eq!(
             command_for_keystroke(&Keystroke::parse("enter").unwrap()),
             Some(EditorCommand::InsertText("\n"))
         );
@@ -1341,18 +1870,83 @@ mod tests {
     #[test]
     fn mouse_positions_map_to_display_points() {
         assert_eq!(
-            display_point_for_mouse_position(Point {
+            visible_display_point_for_mouse_position(Point {
                 x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
                 y: EDITOR_PADDING + HEADER_HEIGHT,
             }),
             (0, 0)
         );
         assert_eq!(
-            display_point_for_mouse_position(Point {
-                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + CHARACTER_WIDTH * 3,
+            visible_display_point_for_mouse_position(Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 3,
                 y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
             }),
             (2, 3)
+        );
+    }
+
+    #[test]
+    fn scroll_wheel_deltas_map_to_viewport_rows() {
+        assert_eq!(
+            scroll_rows_for_delta(ScrollDelta::Lines(Point::new(0.0, -3.0))),
+            3
+        );
+        assert_eq!(
+            scroll_rows_for_delta(ScrollDelta::Lines(Point::new(0.0, 2.0))),
+            -2
+        );
+        assert_eq!(
+            scroll_rows_for_delta(ScrollDelta::Pixels(Point::new(
+                Pixels::ZERO,
+                LINE_HEIGHT * -2.0
+            ))),
+            2
+        );
+        assert_eq!(
+            scroll_rows_for_delta(ScrollDelta::Pixels(Point::new(Pixels::ZERO, Pixels::ZERO))),
+            0
+        );
+    }
+
+    #[test]
+    fn viewport_offsets_mouse_display_points() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(2);
+        view.dispatch_command(EditorCommand::ScrollDown).unwrap();
+
+        assert_eq!(
+            view.display_point_for_mouse_position(Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            }),
+            (2, 0)
+        );
+    }
+
+    #[test]
+    fn mouse_positions_map_to_utf8_safe_source_offsets() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "a😀c").into_handle(),
+        );
+        let view = EditorView::new(editor);
+
+        assert_eq!(
+            view.utf8_offset_for_mouse_position(Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            }),
+            5
+        );
+        assert_eq!(
+            view.utf8_offset_for_mouse_position(Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 3,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            }),
+            6
         );
     }
 
@@ -1400,6 +1994,83 @@ mod tests {
         assert_eq!(view.text(), "abc");
         assert_eq!(view.marked_range, Some(1..2));
         assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "ab|c");
+    }
+
+    #[gpui::test]
+    fn input_handler_character_index_for_point_uses_utf16_offsets(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "a😀c").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(
+                    gpui::EntityInputHandler::character_index_for_point(
+                        view,
+                        Point {
+                            x: EDITOR_PADDING
+                                + LINE_NUMBER_WIDTH
+                                + CONTENT_GAP
+                                + DISPLAY_COLUMN_WIDTH * 2,
+                            y: EDITOR_PADDING + HEADER_HEIGHT,
+                        },
+                        window,
+                        cx,
+                    ),
+                    Some(3)
+                );
+                assert_eq!(
+                    gpui::EntityInputHandler::character_index_for_point(
+                        view,
+                        Point {
+                            x: EDITOR_PADDING
+                                + LINE_NUMBER_WIDTH
+                                + CONTENT_GAP
+                                + DISPLAY_COLUMN_WIDTH * 3,
+                            y: EDITOR_PADDING + HEADER_HEIGHT,
+                        },
+                        window,
+                        cx,
+                    ),
+                    Some(4)
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_mouse_click_uses_utf8_safe_display_columns(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "a😀c").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a😀|c");
+        });
     }
 
     #[gpui::test]
@@ -1490,6 +2161,77 @@ mod tests {
     }
 
     #[gpui::test]
+    fn gpui_keyboard_page_navigation_updates_viewport(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4\n5").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle).with_viewport_rows(2)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        cx.simulate_keystrokes("pagedown shift-pagedown pageup");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 2);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|2");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_scroll_wheel_updates_viewport(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4\n5").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle).with_viewport_rows(2)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            delta: ScrollDelta::Lines(Point::new(0.0, -1.0)),
+            modifiers: Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 1);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "1");
+        });
+
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|1");
+        });
+    }
+
+    #[gpui::test]
     fn gpui_clipboard_shortcuts_copy_cut_and_paste(cx: &mut gpui::TestAppContext) {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -1551,7 +2293,7 @@ mod tests {
         });
         cx.simulate_click(
             Point {
-                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + CHARACTER_WIDTH * 2,
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
                 y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
             },
             Modifiers::default(),
@@ -1562,7 +2304,7 @@ mod tests {
 
         cx.simulate_click(
             Point {
-                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + CHARACTER_WIDTH,
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH,
                 y: EDITOR_PADDING + HEADER_HEIGHT,
             },
             Modifiers {
@@ -1573,6 +2315,122 @@ mod tests {
         view.update(cx, |view, _| {
             assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[|bc]");
             assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[de]f");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_mouse_drag_extends_selection(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\ndef").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        view.update(cx, |view, _| {
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[bc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[de]|f");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_double_click_selects_word_and_triple_click_selects_line(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "one two\nthree four").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 5,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "one t|wo"
+            );
+        });
+
+        cx.simulate_event(MouseDownEvent {
+            position: Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 5,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "one [two]|"
+            );
+        });
+
+        cx.simulate_event(MouseDownEvent {
+            position: Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 3,
+            first_mouse: false,
+        });
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)[1].text_with_overlays(),
+                "[three four]|"
+            );
         });
     }
 }

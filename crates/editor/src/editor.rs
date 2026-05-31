@@ -153,6 +153,16 @@ impl EditorModel {
         DisplayMap::new(soft_wrap_column).snapshot(&self.snapshot())
     }
 
+    pub fn source_offset_for_display_point(
+        &self,
+        row: usize,
+        column: usize,
+        soft_wrap_column: Option<usize>,
+    ) -> usize {
+        self.display_snapshot(soft_wrap_column)
+            .source_offset_for_display_point(DisplayPoint { row, column })
+    }
+
     pub fn selections(&self) -> &[Selection] {
         &self.selections
     }
@@ -354,6 +364,32 @@ impl EditorModel {
         }
         selection.goal = SelectionGoal::None;
         self.set_active_selection(selection)
+    }
+
+    pub fn select_word_at_display_point(
+        &mut self,
+        row: usize,
+        column: usize,
+        soft_wrap_column: Option<usize>,
+    ) {
+        let display = self.display_snapshot(soft_wrap_column);
+        let text = self.snapshot().text().to_string();
+        let offset = display.source_offset_for_display_point(DisplayPoint { row, column });
+        let range = word_range_at_offset(&text, offset);
+        self.select(range);
+    }
+
+    pub fn select_line_at_display_point(
+        &mut self,
+        row: usize,
+        column: usize,
+        soft_wrap_column: Option<usize>,
+    ) {
+        let display = self.display_snapshot(soft_wrap_column);
+        let offset = display.source_offset_for_display_point(DisplayPoint { row, column });
+        let text = self.snapshot().text().to_string();
+        let range = line_range_at_offset(&text, offset);
+        self.select(range);
     }
 
     pub fn selected_text(&self) -> String {
@@ -939,6 +975,61 @@ fn is_word_char(character: char) -> bool {
     character == '_' || character.is_alphanumeric()
 }
 
+fn word_range_at_offset(text: &str, offset: usize) -> Range<usize> {
+    let mut clipped = floor_char_boundary(text, offset);
+    if clipped == text.len() && clipped > 0 {
+        clipped = previous_char_boundary(text, clipped);
+    }
+
+    let Some(character) = text.get(clipped..).and_then(|text| text.chars().next()) else {
+        return clipped..clipped;
+    };
+    if !is_word_char(character) {
+        return clipped..next_char_boundary(text, clipped);
+    }
+
+    let mut start = clipped;
+    while start > 0 {
+        let previous = previous_char_boundary(text, start);
+        let Some(character) = text
+            .get(previous..start)
+            .and_then(|text| text.chars().next())
+        else {
+            break;
+        };
+        if !is_word_char(character) {
+            break;
+        }
+        start = previous;
+    }
+
+    let mut end = clipped;
+    while end < text.len() {
+        let Some(character) = text.get(end..).and_then(|text| text.chars().next()) else {
+            break;
+        };
+        if !is_word_char(character) {
+            break;
+        }
+        end += character.len_utf8();
+    }
+
+    start..end
+}
+
+fn line_range_at_offset(text: &str, offset: usize) -> Range<usize> {
+    let clipped = floor_char_boundary(text, offset);
+    let start = text[..clipped]
+        .rfind('\n')
+        .map(|offset| offset + 1)
+        .unwrap_or(0);
+    let end = text[clipped..]
+        .find('\n')
+        .map(|offset| clipped + offset)
+        .unwrap_or(text.len());
+    start..end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1279,6 +1370,33 @@ mod tests {
         assert_eq!(selection.head(), 1);
         assert_eq!(selection.tail(), 6);
         assert!(selection.reversed);
+    }
+
+    #[test]
+    fn select_word_at_display_point_uses_word_boundaries() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one, two_é");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_word_at_display_point(0, 6, None);
+        assert_eq!(editor.resolved_selections()[0].range(), 5..11);
+        assert_eq!(editor.selected_text(), "two_é");
+
+        editor.select_word_at_display_point(0, 3, None);
+        assert_eq!(editor.resolved_selections()[0].range(), 3..4);
+        assert_eq!(editor.selected_text(), ",");
+    }
+
+    #[test]
+    fn select_line_at_display_point_selects_source_line_without_newline() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\ndef\n");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_line_at_display_point(1, 1, None);
+        assert_eq!(editor.resolved_selections()[0].range(), 4..7);
+        assert_eq!(editor.selected_text(), "def");
+
+        editor.select_line_at_display_point(2, 0, None);
+        assert_eq!(editor.resolved_selections()[0].range(), 8..8);
     }
 
     #[test]

@@ -42,7 +42,7 @@ impl DisplaySnapshot {
         let Some(row) = self.rows.get(point.row) else {
             return self.source_len;
         };
-        (row.source_range.start + point.column).min(row.source_range.end)
+        row.source_range.start + source_column_for_display_column(&row.text, point.column)
     }
 
     pub fn display_point_for_source_offset(&self, source_offset: usize) -> DisplayPoint {
@@ -51,7 +51,10 @@ impl DisplaySnapshot {
             if source_offset >= row.source_range.start && source_offset <= row.source_range.end {
                 return DisplayPoint {
                     row: row.row,
-                    column: source_offset - row.source_range.start,
+                    column: display_column_for_source_column(
+                        &row.text,
+                        source_offset - row.source_range.start,
+                    ),
                 };
             }
         }
@@ -60,7 +63,7 @@ impl DisplaySnapshot {
             .last()
             .map(|row| DisplayPoint {
                 row: row.row,
-                column: row.text.len(),
+                column: row.text.chars().count(),
             })
             .unwrap_or(DisplayPoint { row: 0, column: 0 })
     }
@@ -81,6 +84,19 @@ impl DisplaySnapshot {
             column: desired_column,
         })
     }
+}
+
+fn source_column_for_display_column(text: &str, display_column: usize) -> usize {
+    text.char_indices()
+        .nth(display_column)
+        .map(|(offset, _)| offset)
+        .unwrap_or(text.len())
+}
+
+fn display_column_for_source_column(text: &str, source_column: usize) -> usize {
+    text.char_indices()
+        .take_while(|(offset, _)| *offset < source_column)
+        .count()
 }
 
 #[derive(Clone, Debug)]
@@ -216,5 +232,45 @@ mod tests {
         assert_eq!(display.source_offset_for_vertical_movement(1, 1, 1), 4);
         assert_eq!(display.source_offset_for_vertical_movement(4, -1, 1), 1);
         assert_eq!(display.source_offset_for_vertical_movement(1, 10, 5), 7);
+    }
+
+    #[test]
+    fn display_columns_map_to_utf8_source_offsets() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "a😀c");
+        let multibuffer = MultiBuffer::singleton("scratch", buffer.into_handle());
+        let display = DisplayMap::new(None).snapshot(&multibuffer.snapshot());
+
+        assert_eq!(
+            display.source_offset_for_display_point(DisplayPoint { row: 0, column: 0 }),
+            0
+        );
+        assert_eq!(
+            display.source_offset_for_display_point(DisplayPoint { row: 0, column: 1 }),
+            1
+        );
+        assert_eq!(
+            display.source_offset_for_display_point(DisplayPoint { row: 0, column: 2 }),
+            5
+        );
+        assert_eq!(
+            display.source_offset_for_display_point(DisplayPoint { row: 0, column: 3 }),
+            6
+        );
+        assert_eq!(
+            display.display_point_for_source_offset(0),
+            DisplayPoint { row: 0, column: 0 }
+        );
+        assert_eq!(
+            display.display_point_for_source_offset(1),
+            DisplayPoint { row: 0, column: 1 }
+        );
+        assert_eq!(
+            display.display_point_for_source_offset(5),
+            DisplayPoint { row: 0, column: 2 }
+        );
+        assert_eq!(
+            display.display_point_for_source_offset(6),
+            DisplayPoint { row: 0, column: 3 }
+        );
     }
 }
