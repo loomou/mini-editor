@@ -98,12 +98,14 @@ pub struct RenderedLine {
     pub cursor_columns: Vec<usize>,
     pub active_cursor_columns: Vec<usize>,
     pub selection_ranges: Vec<Range<usize>>,
+    pub marked_ranges: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedLineFragment {
     pub text: String,
     pub selected: bool,
+    pub marked: bool,
     pub cursor: bool,
     pub active_cursor: bool,
 }
@@ -131,6 +133,10 @@ impl RenderedLine {
         for range in &self.selection_ranges {
             markers.push((range.start, '['));
             markers.push((range.end, ']'));
+        }
+        for range in &self.marked_ranges {
+            markers.push((range.start, '{'));
+            markers.push((range.end, '}'));
         }
         for column in &self.cursor_columns {
             markers.push((*column, '|'));
@@ -164,6 +170,14 @@ impl RenderedLine {
                 boundaries.push(range.end);
             }
         }
+        for range in &self.marked_ranges {
+            if range.start <= text_column_count {
+                boundaries.push(range.start);
+            }
+            if range.end <= text_column_count {
+                boundaries.push(range.end);
+            }
+        }
         for column in &self.cursor_columns {
             if *column <= text_column_count {
                 boundaries.push(*column);
@@ -190,6 +204,7 @@ impl RenderedLine {
                 fragments.push(RenderedLineFragment {
                     text: self.text[start_byte..end_byte].to_string(),
                     selected: self.range_is_selected(start_column..end_column),
+                    marked: self.range_is_marked(start_column..end_column),
                     cursor: false,
                     active_cursor: false,
                 });
@@ -202,6 +217,7 @@ impl RenderedLine {
             fragments.push(RenderedLineFragment {
                 text: String::new(),
                 selected: false,
+                marked: false,
                 cursor: false,
                 active_cursor: false,
             });
@@ -228,6 +244,7 @@ impl RenderedLine {
             fragments.push(RenderedLineFragment {
                 text: String::new(),
                 selected: false,
+                marked: false,
                 cursor: true,
                 active_cursor: active_cursor && cursor_index == 0,
             });
@@ -238,6 +255,12 @@ impl RenderedLine {
         self.selection_ranges
             .iter()
             .any(|selection| selection.start < range.end && selection.end > range.start)
+    }
+
+    fn range_is_marked(&self, range: Range<usize>) -> bool {
+        self.marked_ranges
+            .iter()
+            .any(|marked| marked.start < range.end && marked.end > range.start)
     }
 }
 
@@ -588,6 +611,52 @@ impl EditorView {
         )
     }
 
+    fn bounds_for_utf16_range(
+        &self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+    ) -> Option<Bounds<Pixels>> {
+        let text = self.editor.snapshot().text().to_string();
+        let range = utf16_range_to_utf8(&text, range_utf16);
+        let display = self.editor.display_snapshot(Some(DEFAULT_SOFT_WRAP_COLUMN));
+        let row_count = self.viewport_rows.max(1);
+        let visible_start = self.viewport_start_row;
+        let visible_end = visible_start + row_count;
+
+        if range.is_empty() {
+            let point = display.display_point_for_source_offset(range.start);
+            if point.row < visible_start || point.row >= visible_end {
+                return None;
+            }
+            return Some(bounds_for_visible_display_range(
+                element_bounds,
+                point.row - visible_start,
+                point.column..point.column,
+            ));
+        }
+
+        display
+            .rows()
+            .iter()
+            .filter(|row| row.row >= visible_start && row.row < visible_end)
+            .find_map(|row| {
+                if range.end <= row.source_range.start || range.start >= row.source_range.end {
+                    return None;
+                }
+                let start = range.start.max(row.source_range.start);
+                let end = range.end.min(row.source_range.end);
+                let start_column =
+                    display_column_for_byte_offset(&row.text, start - row.source_range.start);
+                let end_column =
+                    display_column_for_byte_offset(&row.text, end - row.source_range.start);
+                Some(bounds_for_visible_display_range(
+                    element_bounds.clone(),
+                    row.row - visible_start,
+                    start_column..end_column,
+                ))
+            })
+    }
+
     fn display_point_for_drag_position(&mut self, position: Point<Pixels>) -> (usize, usize) {
         let (visible_row, display_column) = visible_display_point_for_mouse_position(position);
         let viewport_rows = self.viewport_rows.max(1);
@@ -701,6 +770,7 @@ impl EditorView {
         let cursors = self.editor.cursor_display_points(soft_wrap_column);
         let active_cursor = self.editor.cursor_display_point(soft_wrap_column).ok();
         let selections = self.editor.resolved_selections();
+        let marked_range = self.marked_range.clone();
 
         display
             .rows()
@@ -724,28 +794,39 @@ impl EditorView {
                     .iter()
                     .filter(|selection| !selection.is_empty())
                     .filter_map(|selection| {
-                        if selection.end <= row.source_range.start
-                            || selection.start >= row.source_range.end
-                        {
-                            return None;
-                        }
-                        let start = selection.start.max(row.source_range.start);
-                        let end = selection.end.min(row.source_range.end);
-                        (start < end).then_some(
-                            display_column_for_byte_offset(
-                                &row.text,
-                                start - row.source_range.start,
-                            )
-                                ..display_column_for_byte_offset(
-                                    &row.text,
-                                    end - row.source_range.start,
-                                ),
+                        display_range_for_source_range(
+                            &row.text,
+                            &row.source_range,
+                            selection.range(),
                         )
+                    })
+                    .collect(),
+                marked_ranges: marked_range
+                    .clone()
+                    .into_iter()
+                    .filter_map(|range| {
+                        display_range_for_source_range(&row.text, &row.source_range, range)
                     })
                     .collect(),
             })
             .collect()
     }
+}
+
+fn display_range_for_source_range(
+    row_text: &str,
+    row_source_range: &Range<usize>,
+    range: Range<usize>,
+) -> Option<Range<usize>> {
+    if range.end <= row_source_range.start || range.start >= row_source_range.end {
+        return None;
+    }
+    let start = range.start.max(row_source_range.start);
+    let end = range.end.min(row_source_range.end);
+    (start < end).then_some(
+        display_column_for_byte_offset(row_text, start - row_source_range.start)
+            ..display_column_for_byte_offset(row_text, end - row_source_range.start),
+    )
 }
 
 struct EditorInputElement {
@@ -816,8 +897,10 @@ fn marker_priority(marker: char) -> usize {
     match marker {
         '|' => 0,
         ']' => 1,
-        '[' => 2,
-        _ => 3,
+        '}' => 2,
+        '[' => 3,
+        '{' => 4,
+        _ => 5,
     }
 }
 
@@ -839,6 +922,30 @@ fn visible_display_point_for_mouse_position(position: Point<Pixels>) -> (usize, 
         ((position.x - column_origin) / DISPLAY_COLUMN_WIDTH).round() as usize
     };
     (row, column)
+}
+
+fn bounds_for_visible_display_range(
+    element_bounds: Bounds<Pixels>,
+    visible_row: usize,
+    columns: Range<usize>,
+) -> Bounds<Pixels> {
+    let column_count = columns.end.saturating_sub(columns.start);
+    let width = if column_count == 0 {
+        CARET_WIDTH
+    } else {
+        DISPLAY_COLUMN_WIDTH * column_count
+    };
+    Bounds {
+        origin: Point {
+            x: element_bounds.origin.x
+                + EDITOR_PADDING
+                + LINE_NUMBER_WIDTH
+                + CONTENT_GAP
+                + DISPLAY_COLUMN_WIDTH * columns.start,
+            y: element_bounds.origin.y + EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * visible_row,
+        },
+        size: size(width, LINE_HEIGHT),
+    }
 }
 
 fn scroll_rows_for_delta(delta: ScrollDelta) -> isize {
@@ -1092,12 +1199,12 @@ impl gpui::EntityInputHandler for EditorView {
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        Some(element_bounds)
+        self.bounds_for_utf16_range(range_utf16, element_bounds)
     }
 
     fn character_index_for_point(
@@ -1188,6 +1295,8 @@ fn render_line_fragment(fragment: RenderedLineFragment) -> impl IntoElement {
             .px(px(1.0))
             .bg(if fragment.selected {
                 rgb(0x264f78)
+            } else if fragment.marked {
+                rgb(0x3a2f14)
             } else {
                 rgb(0x1f2328)
             })
@@ -1288,6 +1397,7 @@ mod tests {
                     cursor_columns: vec![0],
                     active_cursor_columns: vec![0],
                     selection_ranges: Vec::new(),
+                    marked_ranges: Vec::new(),
                 },
                 RenderedLine {
                     line_number: 2,
@@ -1296,6 +1406,7 @@ mod tests {
                     cursor_columns: Vec::new(),
                     active_cursor_columns: Vec::new(),
                     selection_ranges: Vec::new(),
+                    marked_ranges: Vec::new(),
                 },
             ]
         );
@@ -1372,6 +1483,24 @@ mod tests {
     }
 
     #[test]
+    fn view_marks_ime_composition_ranges_on_wrapped_rows() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcdef").into_handle(),
+        );
+        let mut view = EditorView::new(editor);
+        view.marked_range = Some(1..4);
+
+        let lines = view.rendered_lines(Some(3));
+
+        assert_eq!(lines[0].marked_ranges, vec![1..3]);
+        assert_eq!(lines[1].marked_ranges, vec![0..1]);
+        assert_eq!(lines[0].text_with_overlays(), "|a{bc}");
+        assert_eq!(lines[1].text_with_overlays(), "{d}ef");
+        assert!(lines[0].visual_fragments()[2].marked);
+    }
+
+    #[test]
     fn rendered_line_builds_visual_fragments_for_selection_and_cursors() {
         let line = RenderedLine {
             line_number: 1,
@@ -1380,6 +1509,7 @@ mod tests {
             cursor_columns: vec![1, 3],
             active_cursor_columns: vec![3],
             selection_ranges: vec![1..3],
+            marked_ranges: Vec::new(),
         };
 
         assert_eq!(
@@ -1388,30 +1518,35 @@ mod tests {
                 RenderedLineFragment {
                     text: "a".to_string(),
                     selected: false,
+                    marked: false,
                     cursor: false,
                     active_cursor: false,
                 },
                 RenderedLineFragment {
                     text: String::new(),
                     selected: false,
+                    marked: false,
                     cursor: true,
                     active_cursor: false,
                 },
                 RenderedLineFragment {
                     text: "bc".to_string(),
                     selected: true,
+                    marked: false,
                     cursor: false,
                     active_cursor: false,
                 },
                 RenderedLineFragment {
                     text: String::new(),
                     selected: false,
+                    marked: false,
                     cursor: true,
                     active_cursor: true,
                 },
                 RenderedLineFragment {
                     text: "d".to_string(),
                     selected: false,
+                    marked: false,
                     cursor: false,
                     active_cursor: false,
                 },
@@ -1993,7 +2128,87 @@ mod tests {
 
         assert_eq!(view.text(), "abc");
         assert_eq!(view.marked_range, Some(1..2));
-        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "ab|c");
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a{b}|c");
+    }
+
+    #[test]
+    fn input_range_bounds_use_utf16_and_display_columns() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "a😀c").into_handle(),
+        );
+        let view = EditorView::new(editor);
+        let element_bounds = Bounds {
+            origin: Point {
+                x: px(100.0),
+                y: px(50.0),
+            },
+            size: size(px(400.0), px(200.0)),
+        };
+
+        assert_eq!(
+            view.bounds_for_utf16_range(1..3, element_bounds.clone()),
+            Some(Bounds {
+                origin: Point {
+                    x: px(100.0)
+                        + EDITOR_PADDING
+                        + LINE_NUMBER_WIDTH
+                        + CONTENT_GAP
+                        + DISPLAY_COLUMN_WIDTH,
+                    y: px(50.0) + EDITOR_PADDING + HEADER_HEIGHT,
+                },
+                size: size(DISPLAY_COLUMN_WIDTH, LINE_HEIGHT),
+            })
+        );
+        assert_eq!(
+            view.bounds_for_utf16_range(3..3, element_bounds),
+            Some(Bounds {
+                origin: Point {
+                    x: px(100.0)
+                        + EDITOR_PADDING
+                        + LINE_NUMBER_WIDTH
+                        + CONTENT_GAP
+                        + DISPLAY_COLUMN_WIDTH * 2,
+                    y: px(50.0) + EDITOR_PADDING + HEADER_HEIGHT,
+                },
+                size: size(CARET_WIDTH, LINE_HEIGHT),
+            })
+        );
+    }
+
+    #[test]
+    fn input_range_bounds_track_viewport_rows() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(1);
+        let element_bounds = Bounds {
+            origin: Point {
+                x: px(10.0),
+                y: px(20.0),
+            },
+            size: size(px(400.0), px(200.0)),
+        };
+
+        assert_eq!(
+            view.bounds_for_utf16_range(4..5, element_bounds.clone()),
+            None
+        );
+
+        view.dispatch_command(EditorCommand::ScrollDown).unwrap();
+        view.dispatch_command(EditorCommand::ScrollDown).unwrap();
+
+        assert_eq!(
+            view.bounds_for_utf16_range(4..5, element_bounds),
+            Some(Bounds {
+                origin: Point {
+                    x: px(10.0) + EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                    y: px(20.0) + EDITOR_PADDING + HEADER_HEIGHT,
+                },
+                size: size(DISPLAY_COLUMN_WIDTH, LINE_HEIGHT),
+            })
+        );
     }
 
     #[gpui::test]
