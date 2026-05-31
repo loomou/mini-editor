@@ -487,6 +487,43 @@ mod tests {
     }
 
     #[test]
+    fn workspace_dispatches_editor_undo_and_redo_commands() {
+        let path = ProjectPath::new(1, "src/main.rs");
+        let mut workspace = Workspace::new();
+        workspace.open_editor(path, "hello");
+
+        workspace
+            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('/')))
+            .unwrap();
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "/hello"
+        );
+
+        let undo = workspace
+            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::Undo))
+            .unwrap()
+            .editor
+            .unwrap();
+        assert!(undo.changed_text);
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "hello"
+        );
+
+        let redo = workspace
+            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::Redo))
+            .unwrap()
+            .editor
+            .unwrap();
+        assert!(redo.changed_text);
+        assert_eq!(
+            workspace.active_rendered_editor(None).unwrap().lines[0].text,
+            "/hello"
+        );
+    }
+
+    #[test]
     fn workspace_tracks_open_editors_and_switches_the_active_editor() {
         let first = ProjectPath::new(1, "src/first.rs");
         let second = ProjectPath::new(1, "src/second.rs");

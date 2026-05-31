@@ -322,6 +322,22 @@ impl MultiBuffer {
         Ok(changed)
     }
 
+    pub fn can_undo(&self) -> bool {
+        self.capability.editable()
+            && self
+                .singleton_buffer()
+                .map(|(_, buffer)| buffer.borrow().can_undo())
+                .unwrap_or(false)
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.capability.editable()
+            && self
+                .singleton_buffer()
+                .map(|(_, buffer)| buffer.borrow().can_redo())
+                .unwrap_or(false)
+    }
+
     pub fn refresh(&mut self) {
         if self.buffers.len() == 1 && self.excerpts.len() == 1 {
             if let Some(buffer_id) = self.excerpts.first().map(|excerpt| excerpt.buffer_id) {
@@ -421,14 +437,22 @@ mod tests {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
         let mut multibuffer = MultiBuffer::singleton("scratch", buffer.into_handle());
 
+        assert!(!multibuffer.can_undo());
+        assert!(!multibuffer.can_redo());
         multibuffer.edit(6..11, "zed").unwrap();
         assert_eq!(multibuffer.snapshot().text(), "hello zed");
+        assert!(multibuffer.can_undo());
+        assert!(!multibuffer.can_redo());
 
         assert!(multibuffer.undo().unwrap());
         assert_eq!(multibuffer.snapshot().text(), "hello world");
+        assert!(!multibuffer.can_undo());
+        assert!(multibuffer.can_redo());
 
         assert!(multibuffer.redo().unwrap());
         assert_eq!(multibuffer.snapshot().text(), "hello zed");
+        assert!(multibuffer.can_undo());
+        assert!(!multibuffer.can_redo());
     }
 
     #[test]

@@ -171,6 +171,14 @@ impl Buffer {
         Ok(self.text.redo())
     }
 
+    pub fn can_undo(&self) -> bool {
+        self.capability.editable() && self.text.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.capability.editable() && self.text.can_redo()
+    }
+
     pub fn save(&mut self) {
         let snapshot = self.text.snapshot();
         self.saved_text = snapshot.text();
@@ -245,6 +253,8 @@ mod tests {
         let mut buffer = Buffer::local(BufferId::new(1).unwrap(), "hello");
         buffer.save();
 
+        assert!(!buffer.can_undo());
+        assert!(!buffer.can_redo());
         buffer
             .edit(TextEdit {
                 range: 5..5,
@@ -252,10 +262,14 @@ mod tests {
             })
             .unwrap();
         assert!(buffer.snapshot().is_dirty());
+        assert!(buffer.can_undo());
+        assert!(!buffer.can_redo());
 
         assert!(buffer.undo().unwrap());
         assert_eq!(buffer.snapshot().text.text(), "hello");
         assert!(buffer.snapshot().is_dirty());
+        assert!(!buffer.can_undo());
+        assert!(buffer.can_redo());
     }
 
     #[test]

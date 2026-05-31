@@ -11,6 +11,8 @@ pub enum EditorCommand {
     InsertChar(char),
     Backspace,
     Delete,
+    Undo,
+    Redo,
     MoveLeft { extend: bool },
     MoveRight { extend: bool },
 }
@@ -108,6 +110,12 @@ impl EditorView {
             }
             EditorCommand::Delete => {
                 self.editor.delete()?;
+            }
+            EditorCommand::Undo => {
+                self.editor.undo()?;
+            }
+            EditorCommand::Redo => {
+                self.editor.redo()?;
             }
             EditorCommand::MoveLeft { extend } => self.editor.move_left(extend)?,
             EditorCommand::MoveRight { extend } => self.editor.move_right(extend)?,

@@ -410,6 +410,14 @@ impl EditorModel {
         Ok(changed)
     }
 
+    pub fn can_undo(&self) -> bool {
+        self.buffer.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.buffer.can_redo()
+    }
+
     fn delete_selection_ranges(
         &mut self,
         edit_ranges: Vec<SelectionEditRange>,
