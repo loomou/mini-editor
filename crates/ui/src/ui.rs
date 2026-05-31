@@ -1,5 +1,5 @@
 use editor::EditorModel;
-use std::ops::Range;
+use std::{ops::Range, time::Duration};
 
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
@@ -17,7 +17,12 @@ const LINE_NUMBER_WIDTH: Pixels = px(48.0);
 const CONTENT_GAP: Pixels = px(12.0);
 const DISPLAY_COLUMN_WIDTH: Pixels = px(8.0);
 const CARET_WIDTH: Pixels = px(2.0);
+const SCROLLBAR_WIDTH: Pixels = px(6.0);
+const SCROLLBAR_GAP: Pixels = px(8.0);
 const DEFAULT_VIEWPORT_ROWS: usize = 20;
+const SCROLLBAR_TRACK_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(350);
+const SCROLLBAR_TRACK_REPEAT_INTERVAL: Duration = Duration::from_millis(75);
+const DRAG_AUTOSCROLL_REPEAT_INTERVAL: Duration = Duration::from_millis(75);
 
 #[derive(Debug)]
 pub struct EditorView {
@@ -25,8 +30,37 @@ pub struct EditorView {
     focus_handle: Option<FocusHandle>,
     marked_range: Option<Range<usize>>,
     selecting_with_mouse: bool,
+    drag_autoscroll: Option<DragAutoscroll>,
+    drag_autoscroll_generation: u64,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    scrollbar_track_press: Option<ScrollbarTrackPress>,
+    scrollbar_track_press_generation: u64,
+    hovered_scrollbar_row: Option<usize>,
     viewport_start_row: usize,
     viewport_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DragAutoscroll {
+    position: Point<Pixels>,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScrollbarDrag {
+    thumb_grab_offset: Pixels,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScrollbarTrackPress {
+    direction: isize,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScrollbarHit {
+    visible_row: usize,
+    thumb_rows: Range<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +86,7 @@ pub enum EditorCommand {
     ScrollUp,
     ScrollDown,
     SelectAll,
+    Cancel,
     Copy,
     Cut,
     Paste,
@@ -70,6 +105,7 @@ pub struct RenderedEditor {
     pub can_undo: bool,
     pub can_redo: bool,
     pub lines: Vec<RenderedLine>,
+    pub scrollbar: Option<RenderedScrollbar>,
 }
 
 impl RenderedEditor {
@@ -88,6 +124,52 @@ impl RenderedEditor {
             availability_label(self.can_redo)
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderedScrollbar {
+    pub first_visible_row: usize,
+    pub visible_rows: usize,
+    pub total_rows: usize,
+    pub hovered_row: Option<usize>,
+    pub pressed: bool,
+}
+
+impl RenderedScrollbar {
+    pub fn thumb_rows(&self) -> Range<usize> {
+        if self.total_rows <= self.visible_rows {
+            return 0..self.visible_rows.max(1);
+        }
+
+        let visible_rows = self.visible_rows.max(1);
+        let thumb_len = (visible_rows * visible_rows)
+            .div_ceil(self.total_rows)
+            .max(1);
+        let max_start = visible_rows.saturating_sub(thumb_len);
+        let scrollable_rows = self.total_rows.saturating_sub(visible_rows).max(1);
+        let thumb_start = (self.first_visible_row.min(scrollable_rows) * max_start
+            + scrollable_rows / 2)
+            / scrollable_rows;
+        thumb_start..thumb_start + thumb_len
+    }
+
+    pub fn row_state(&self, row: usize) -> RenderedScrollbarRowState {
+        let hovered = self.hovered_row == Some(row);
+        let thumb = self.thumb_rows().contains(&row);
+        let pressed = self.pressed && hovered;
+        RenderedScrollbarRowState {
+            thumb,
+            hovered,
+            pressed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderedScrollbarRowState {
+    pub thumb: bool,
+    pub hovered: bool,
+    pub pressed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,6 +369,12 @@ impl EditorView {
             focus_handle: None,
             marked_range: None,
             selecting_with_mouse: false,
+            drag_autoscroll: None,
+            drag_autoscroll_generation: 0,
+            scrollbar_drag: None,
+            scrollbar_track_press: None,
+            scrollbar_track_press_generation: 0,
+            hovered_scrollbar_row: None,
             viewport_start_row: 0,
             viewport_rows: DEFAULT_VIEWPORT_ROWS,
         }
@@ -298,6 +386,12 @@ impl EditorView {
             focus_handle: Some(focus_handle),
             marked_range: None,
             selecting_with_mouse: false,
+            drag_autoscroll: None,
+            drag_autoscroll_generation: 0,
+            scrollbar_drag: None,
+            scrollbar_track_press: None,
+            scrollbar_track_press_generation: 0,
+            hovered_scrollbar_row: None,
             viewport_start_row: 0,
             viewport_rows: DEFAULT_VIEWPORT_ROWS,
         }
@@ -369,6 +463,7 @@ impl EditorView {
                 reveal_cursor = false;
             }
             EditorCommand::SelectAll => self.editor.select_all(),
+            EditorCommand::Cancel => self.cancel_interaction(),
             EditorCommand::Copy | EditorCommand::Cut | EditorCommand::Paste => {}
         }
 
@@ -388,12 +483,14 @@ impl EditorView {
     }
 
     pub fn rendered_editor(&self, soft_wrap_column: Option<usize>) -> RenderedEditor {
+        let display = self.editor.display_snapshot(soft_wrap_column);
         RenderedEditor {
             title: self.editor.title(),
             is_dirty: self.editor.is_dirty(),
             can_undo: self.editor.can_undo(),
             can_redo: self.editor.can_redo(),
             lines: self.rendered_lines(soft_wrap_column),
+            scrollbar: self.rendered_scrollbar_for_row_count(display.rows().len()),
         }
     }
 
@@ -404,6 +501,17 @@ impl EditorView {
 
     pub fn viewport_start_row(&self) -> usize {
         self.viewport_start_row
+    }
+
+    fn rendered_scrollbar_for_row_count(&self, row_count: usize) -> Option<RenderedScrollbar> {
+        let visible_rows = self.viewport_rows.max(1);
+        (row_count > visible_rows).then_some(RenderedScrollbar {
+            first_visible_row: self.viewport_start_row,
+            visible_rows,
+            total_rows: row_count,
+            hovered_row: self.hovered_scrollbar_row.filter(|row| *row < visible_rows),
+            pressed: self.scrollbar_drag.is_some() || self.scrollbar_track_press.is_some(),
+        })
     }
 
     fn handle_key_down(
@@ -433,10 +541,38 @@ impl EditorView {
             focus_handle.focus(window);
         }
 
+        if let Some(hit) = self.scrollbar_hit_for_position(event.position) {
+            self.hovered_scrollbar_row = Some(hit.visible_row);
+            self.selecting_with_mouse = false;
+            self.drag_autoscroll = None;
+            if hit.thumb_rows.contains(&hit.visible_row) {
+                let thumb_top = scrollbar_track_top() + LINE_HEIGHT * hit.thumb_rows.start;
+                self.scrollbar_drag = Some(ScrollbarDrag {
+                    thumb_grab_offset: event.position.y - thumb_top,
+                });
+                self.scrollbar_track_press = None;
+            } else if hit.visible_row < hit.thumb_rows.start {
+                self.scroll_viewport(-1);
+                self.scrollbar_drag = None;
+                self.start_scrollbar_track_repeat(-1, cx);
+            } else {
+                self.scroll_viewport(1);
+                self.scrollbar_drag = None;
+                self.start_scrollbar_track_repeat(1, cx);
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        self.hovered_scrollbar_row = None;
         let (row, column) = self.display_point_for_mouse_position(event.position);
         let result = match event.click_count {
             3.. => {
                 self.selecting_with_mouse = false;
+                self.drag_autoscroll = None;
+                self.scrollbar_drag = None;
+                self.scrollbar_track_press = None;
                 self.editor.select_line_at_display_point(
                     row,
                     column,
@@ -446,6 +582,9 @@ impl EditorView {
             }
             2 => {
                 self.selecting_with_mouse = false;
+                self.drag_autoscroll = None;
+                self.scrollbar_drag = None;
+                self.scrollbar_track_press = None;
                 self.editor.select_word_at_display_point(
                     row,
                     column,
@@ -455,6 +594,9 @@ impl EditorView {
             }
             _ => {
                 self.selecting_with_mouse = true;
+                self.drag_autoscroll = None;
+                self.scrollbar_drag = None;
+                self.scrollbar_track_press = None;
                 self.editor.select_display_point(
                     row,
                     column,
@@ -480,17 +622,31 @@ impl EditorView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.selecting_with_mouse {
+        let previous_hovered_scrollbar_row = self.hovered_scrollbar_row;
+        self.hovered_scrollbar_row = self.scrollbar_visible_row_for_position(event.position);
+
+        if let Some(drag) = self.scrollbar_drag {
+            let before = self.viewport_start_row;
+            self.scroll_viewport_to_scrollbar_y(event.position.y, drag.thumb_grab_offset);
+            if self.viewport_start_row != before
+                || self.hovered_scrollbar_row != previous_hovered_scrollbar_row
+            {
+                cx.notify();
+                cx.stop_propagation();
+            }
             return;
         }
 
-        let (row, column) = self.display_point_for_drag_position(event.position);
-        match self
-            .editor
-            .select_display_point(row, column, true, Some(DEFAULT_SOFT_WRAP_COLUMN))
-        {
-            Ok(()) => {
-                self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
+        if !self.selecting_with_mouse {
+            if self.hovered_scrollbar_row != previous_hovered_scrollbar_row {
+                cx.notify();
+            }
+            return;
+        }
+
+        match self.extend_selection_for_drag_position(event.position) {
+            Ok(_) => {
+                self.update_drag_autoscroll(event.position, cx);
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -523,8 +679,16 @@ impl EditorView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.selecting_with_mouse {
+        if self.selecting_with_mouse
+            || self.drag_autoscroll.is_some()
+            || self.scrollbar_drag.is_some()
+            || self.scrollbar_track_press.is_some()
+        {
             self.selecting_with_mouse = false;
+            self.drag_autoscroll = None;
+            self.scrollbar_drag = None;
+            self.scrollbar_track_press = None;
+            self.hovered_scrollbar_row = self.scrollbar_visible_row_for_position(_event.position);
             cx.notify();
             cx.stop_propagation();
         }
@@ -549,6 +713,33 @@ impl EditorView {
             }
             command => self.dispatch_command(command),
         }
+    }
+
+    fn cancel_interaction(&mut self) {
+        self.marked_range = None;
+        self.selecting_with_mouse = false;
+        self.drag_autoscroll = None;
+        self.scrollbar_drag = None;
+        self.scrollbar_track_press = None;
+
+        let selections = self.editor.resolved_selections();
+        if selections.is_empty() {
+            return;
+        }
+
+        let active_selection_index = self.editor.active_selection_index();
+        self.editor.select_anchor_heads(
+            selections
+                .iter()
+                .map(|selection| {
+                    let head = selection.head();
+                    (head, head)
+                })
+                .collect(),
+        );
+        let _ = self
+            .editor
+            .set_active_selection_index(active_selection_index);
     }
 
     fn move_page(&mut self, direction: isize, extend: bool) -> Result<(), String> {
@@ -576,6 +767,161 @@ impl EditorView {
         self.clamp_viewport(Some(DEFAULT_SOFT_WRAP_COLUMN));
     }
 
+    fn update_drag_autoscroll(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.selecting_with_mouse
+            || self
+                .drag_autoscroll_direction_for_position(position)
+                .is_none()
+        {
+            self.drag_autoscroll = None;
+            return;
+        }
+
+        if let Some(autoscroll) = self.drag_autoscroll.as_mut() {
+            autoscroll.position = position;
+            return;
+        }
+
+        self.drag_autoscroll_generation = self.drag_autoscroll_generation.wrapping_add(1);
+        let generation = self.drag_autoscroll_generation;
+        self.drag_autoscroll = Some(DragAutoscroll {
+            position,
+            generation,
+        });
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(DRAG_AUTOSCROLL_REPEAT_INTERVAL)
+                    .await;
+
+                let should_continue = this
+                    .update(cx, |view, cx| {
+                        let changed = match view.repeat_drag_autoscroll(generation) {
+                            Ok(changed) => changed,
+                            Err(error) => {
+                                eprintln!("mini_ui drag autoscroll failed: {error}");
+                                false
+                            }
+                        };
+                        if changed {
+                            cx.notify();
+                        }
+                        changed
+                    })
+                    .unwrap_or(false);
+
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn repeat_drag_autoscroll(&mut self, generation: u64) -> Result<bool, String> {
+        let Some(autoscroll) = self.drag_autoscroll else {
+            return Ok(false);
+        };
+        if autoscroll.generation != generation || !self.selecting_with_mouse {
+            return Ok(false);
+        }
+
+        let before_viewport = self.viewport_start_row;
+        let before_selections = selection_state(&self.editor);
+        self.extend_selection_for_drag_position(autoscroll.position)?;
+        let changed = self.viewport_start_row != before_viewport
+            || selection_state(&self.editor) != before_selections;
+        if !changed {
+            self.drag_autoscroll = None;
+        }
+        Ok(changed)
+    }
+
+    fn start_scrollbar_track_repeat(&mut self, direction: isize, cx: &mut Context<Self>) {
+        self.scrollbar_track_press_generation =
+            self.scrollbar_track_press_generation.wrapping_add(1);
+        let generation = self.scrollbar_track_press_generation;
+        let press = ScrollbarTrackPress {
+            direction,
+            generation,
+        };
+        self.scrollbar_track_press = Some(press);
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(SCROLLBAR_TRACK_REPEAT_INITIAL_DELAY)
+                .await;
+
+            loop {
+                let should_continue = this
+                    .update(cx, |view, cx| {
+                        let moved = view.repeat_scrollbar_track_press(press);
+                        if moved {
+                            cx.notify();
+                        }
+                        moved
+                    })
+                    .unwrap_or(false);
+
+                if !should_continue {
+                    break;
+                }
+
+                cx.background_executor()
+                    .timer(SCROLLBAR_TRACK_REPEAT_INTERVAL)
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn repeat_scrollbar_track_press(&mut self, press: ScrollbarTrackPress) -> bool {
+        if self.scrollbar_track_press != Some(press) {
+            return false;
+        }
+
+        let before = self.viewport_start_row;
+        self.scroll_viewport(press.direction);
+        self.viewport_start_row != before
+    }
+
+    #[cfg(test)]
+    fn scroll_viewport_to_scrollbar_row(&mut self, visible_row: usize, thumb_grab_row: usize) {
+        self.scroll_viewport_to_scrollbar_y(
+            scrollbar_track_top() + LINE_HEIGHT * visible_row,
+            LINE_HEIGHT * thumb_grab_row,
+        );
+    }
+
+    fn scroll_viewport_to_scrollbar_y(&mut self, y: Pixels, thumb_grab_offset: Pixels) {
+        let Some(scrollbar) = self.rendered_scrollbar_for_current_view() else {
+            return;
+        };
+        let thumb_rows = scrollbar.thumb_rows();
+        let thumb_len = thumb_rows.len().max(1);
+        let max_thumb_start = scrollbar.visible_rows.saturating_sub(thumb_len);
+        if max_thumb_start == 0 {
+            self.viewport_start_row = 0;
+            return;
+        }
+
+        let max_thumb_top = LINE_HEIGHT * max_thumb_start;
+        let thumb_top = y - scrollbar_track_top() - thumb_grab_offset;
+        let thumb_top = if thumb_top < Pixels::ZERO {
+            Pixels::ZERO
+        } else if thumb_top > max_thumb_top {
+            max_thumb_top
+        } else {
+            thumb_top
+        };
+
+        let scrollable_rows = scrollbar.total_rows.saturating_sub(scrollbar.visible_rows);
+        let scroll_ratio = thumb_top / max_thumb_top;
+        self.viewport_start_row = (scroll_ratio * scrollable_rows as f32).round() as usize;
+        self.clamp_viewport(Some(DEFAULT_SOFT_WRAP_COLUMN));
+    }
+
     fn reveal_active_cursor(&mut self, soft_wrap_column: Option<usize>) {
         let Ok(cursor) = self.editor.cursor_display_point(soft_wrap_column) else {
             return;
@@ -595,6 +941,40 @@ impl EditorView {
         let row_count = self.editor.display_snapshot(soft_wrap_column).rows().len();
         let max_start = row_count.saturating_sub(self.viewport_rows.max(1));
         self.viewport_start_row = self.viewport_start_row.min(max_start);
+    }
+
+    fn rendered_scrollbar_for_current_view(&self) -> Option<RenderedScrollbar> {
+        let display = self.editor.display_snapshot(Some(DEFAULT_SOFT_WRAP_COLUMN));
+        self.rendered_scrollbar_for_row_count(display.rows().len())
+    }
+
+    fn scrollbar_hit_for_position(&self, position: Point<Pixels>) -> Option<ScrollbarHit> {
+        let visible_row = self.scrollbar_visible_row_for_position(position)?;
+        let scrollbar = self.rendered_scrollbar_for_current_view()?;
+        let thumb_rows = scrollbar.thumb_rows();
+        Some(ScrollbarHit {
+            visible_row,
+            thumb_rows,
+        })
+    }
+
+    fn scrollbar_visible_row_for_position(&self, position: Point<Pixels>) -> Option<usize> {
+        let track_left = scrollbar_track_left();
+        if position.x < track_left || position.x > track_left + SCROLLBAR_WIDTH {
+            return None;
+        }
+
+        self.scrollbar_visible_row_for_y(position.y)
+    }
+
+    fn scrollbar_visible_row_for_y(&self, y: Pixels) -> Option<usize> {
+        let row_origin = EDITOR_PADDING + HEADER_HEIGHT;
+        if y < row_origin {
+            return None;
+        }
+
+        let visible_row = ((y - row_origin) / LINE_HEIGHT).floor() as usize;
+        (visible_row < self.viewport_rows.max(1)).then_some(visible_row)
     }
 
     fn display_point_for_mouse_position(&self, position: Point<Pixels>) -> (usize, usize) {
@@ -657,22 +1037,44 @@ impl EditorView {
             })
     }
 
+    fn extend_selection_for_drag_position(
+        &mut self,
+        position: Point<Pixels>,
+    ) -> Result<(), String> {
+        let (row, column) = self.display_point_for_drag_position(position);
+        self.editor
+            .select_display_point(row, column, true, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
+        self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
+        Ok(())
+    }
+
     fn display_point_for_drag_position(&mut self, position: Point<Pixels>) -> (usize, usize) {
         let (visible_row, display_column) = visible_display_point_for_mouse_position(position);
         let viewport_rows = self.viewport_rows.max(1);
 
+        match self.drag_autoscroll_direction_for_position(position) {
+            Some(direction) if direction < 0 => {
+                self.scroll_viewport_by_rows(-1);
+                (self.viewport_start_row, display_column)
+            }
+            Some(_) => {
+                self.scroll_viewport_by_rows(1);
+                (self.viewport_start_row + viewport_rows - 1, display_column)
+            }
+            None => (self.viewport_start_row + visible_row, display_column),
+        }
+    }
+
+    fn drag_autoscroll_direction_for_position(&self, position: Point<Pixels>) -> Option<isize> {
+        let (visible_row, _) = visible_display_point_for_mouse_position(position);
         let row_origin = EDITOR_PADDING + HEADER_HEIGHT;
         if position.y < row_origin {
-            self.scroll_viewport_by_rows(-1);
-            return (self.viewport_start_row, display_column);
+            Some(-1)
+        } else if visible_row >= self.viewport_rows.max(1) {
+            Some(1)
+        } else {
+            None
         }
-
-        if visible_row >= viewport_rows {
-            self.scroll_viewport_by_rows(1);
-            return (self.viewport_start_row + viewport_rows - 1, display_column);
-        }
-
-        (self.viewport_start_row + visible_row, display_column)
     }
 
     fn dispatch_paste_text(&mut self, text: &str) -> Result<CommandOutcome, String> {
@@ -909,7 +1311,7 @@ fn availability_label(available: bool) -> &'static str {
 }
 
 fn visible_display_point_for_mouse_position(position: Point<Pixels>) -> (usize, usize) {
-    let row_origin = EDITOR_PADDING + HEADER_HEIGHT;
+    let row_origin = scrollbar_track_top();
     let column_origin = EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP;
     let row = if position.y <= row_origin {
         0
@@ -922,6 +1324,18 @@ fn visible_display_point_for_mouse_position(position: Point<Pixels>) -> (usize, 
         ((position.x - column_origin) / DISPLAY_COLUMN_WIDTH).round() as usize
     };
     (row, column)
+}
+
+fn editor_text_width() -> Pixels {
+    DISPLAY_COLUMN_WIDTH * DEFAULT_SOFT_WRAP_COLUMN
+}
+
+fn scrollbar_track_left() -> Pixels {
+    EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + editor_text_width() + SCROLLBAR_GAP
+}
+
+fn scrollbar_track_top() -> Pixels {
+    EDITOR_PADDING + HEADER_HEIGHT
 }
 
 fn bounds_for_visible_display_range(
@@ -1027,6 +1441,7 @@ fn command_for_keystroke(keystroke: &Keystroke) -> Option<EditorCommand> {
         }),
         "enter" if navigation_modifiers(modifiers) => Some(EditorCommand::InsertText("\n")),
         "a" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::SelectAll),
+        "escape" if navigation_modifiers(modifiers) => Some(EditorCommand::Cancel),
         "c" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Copy),
         "x" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Cut),
         "v" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Paste),
@@ -1223,6 +1638,11 @@ impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rendered = self.rendered_editor(Some(100));
         let focus_handle = self.render_focus_handle(cx);
+        let header_text = rendered.header_text();
+        let command_status_text = rendered.command_status_text();
+        let is_dirty = rendered.is_dirty;
+        let lines = rendered.lines;
+        let scrollbar = rendered.scrollbar;
         div()
             .size_full()
             .p_4()
@@ -1244,34 +1664,48 @@ impl Render for EditorView {
                     .flex()
                     .gap_3()
                     .mb_3()
-                    .text_color(if rendered.is_dirty {
+                    .text_color(if is_dirty {
                         rgb(0xffd33d)
                     } else {
                         rgb(0x8b949e)
                     })
-                    .child(rendered.header_text())
-                    .child(rendered.command_status_text()),
+                    .child(header_text)
+                    .child(command_status_text),
             )
-            .children(rendered.lines.into_iter().map(|line| {
+            .child(
                 div()
                     .flex()
-                    .gap_3()
-                    .h(LINE_HEIGHT)
-                    .items_center()
-                    .child(div().w(px(48.0)).text_color(rgb(0x6e7681)).child(
-                        if line.continuation {
-                            "...".to_string()
-                        } else {
-                            line.line_number.to_string()
-                        },
-                    ))
-                    .child(render_visual_line(line))
-            }))
+                    .items_start()
+                    .gap(SCROLLBAR_GAP)
+                    .child(div().children(lines.into_iter().map(render_editor_row)))
+                    .when_some(scrollbar, |this, scrollbar| {
+                        this.child(render_scrollbar(scrollbar))
+                    }),
+            )
     }
 }
 
+fn render_editor_row(line: RenderedLine) -> impl IntoElement {
+    div()
+        .flex()
+        .gap_3()
+        .h(LINE_HEIGHT)
+        .items_center()
+        .child(
+            div()
+                .w(LINE_NUMBER_WIDTH)
+                .text_color(rgb(0x6e7681))
+                .child(if line.continuation {
+                    "...".to_string()
+                } else {
+                    line.line_number.to_string()
+                }),
+        )
+        .child(render_visual_line(line))
+}
+
 fn render_visual_line(line: RenderedLine) -> impl IntoElement {
-    div().flex().items_center().children(
+    div().w(editor_text_width()).flex().items_center().children(
         line.visual_fragments()
             .into_iter()
             .map(render_line_fragment),
@@ -1303,6 +1737,28 @@ fn render_line_fragment(fragment: RenderedLineFragment) -> impl IntoElement {
             .child(fragment.text)
             .into_any_element()
     }
+}
+
+fn render_scrollbar(scrollbar: RenderedScrollbar) -> impl IntoElement {
+    div()
+        .w(SCROLLBAR_WIDTH)
+        .children((0..scrollbar.visible_rows).map(move |row| {
+            let row_state = scrollbar.row_state(row);
+            div()
+                .w(SCROLLBAR_WIDTH)
+                .h(LINE_HEIGHT)
+                .bg(if row_state.pressed {
+                    rgb(0xf0f6fc)
+                } else if row_state.thumb && row_state.hovered {
+                    rgb(0x8b949e)
+                } else if row_state.thumb {
+                    rgb(0x6e7681)
+                } else if row_state.hovered {
+                    rgb(0x484f58)
+                } else {
+                    rgb(0x30363d)
+                })
+        }))
 }
 
 pub fn run(editor: EditorModel) {
@@ -1377,6 +1833,218 @@ mod tests {
         assert!(!after_undo.can_undo);
         assert!(after_undo.can_redo);
         assert_eq!(after_undo.command_status_text(), "undo:off redo:on");
+    }
+
+    #[test]
+    fn rendered_editor_hides_scrollbar_when_all_rows_are_visible() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1").into_handle(),
+        );
+        let view = EditorView::new(editor).with_viewport_rows(2);
+
+        assert_eq!(view.rendered_editor(None).scrollbar, None);
+    }
+
+    #[test]
+    fn rendered_editor_exposes_scrollbar_for_scrollable_viewport() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(2);
+
+        let rendered = view.rendered_editor(None);
+        assert_eq!(
+            rendered.scrollbar,
+            Some(RenderedScrollbar {
+                first_visible_row: 0,
+                visible_rows: 2,
+                total_rows: 5,
+                hovered_row: None,
+                pressed: false,
+            })
+        );
+
+        view.dispatch_command(EditorCommand::ScrollDown).unwrap();
+        assert_eq!(
+            view.rendered_editor(None).scrollbar,
+            Some(RenderedScrollbar {
+                first_visible_row: 2,
+                visible_rows: 2,
+                total_rows: 5,
+                hovered_row: None,
+                pressed: false,
+            })
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_rows_track_viewport_position() {
+        let scrollbar = RenderedScrollbar {
+            first_visible_row: 0,
+            visible_rows: 2,
+            total_rows: 5,
+            hovered_row: None,
+            pressed: false,
+        };
+        assert_eq!(scrollbar.thumb_rows(), 0..1);
+
+        let scrollbar = RenderedScrollbar {
+            first_visible_row: 2,
+            visible_rows: 2,
+            total_rows: 5,
+            hovered_row: None,
+            pressed: false,
+        };
+        assert_eq!(scrollbar.thumb_rows(), 1..2);
+
+        let scrollbar = RenderedScrollbar {
+            first_visible_row: 0,
+            visible_rows: 10,
+            total_rows: 5,
+            hovered_row: None,
+            pressed: false,
+        };
+        assert_eq!(scrollbar.thumb_rows(), 0..10);
+    }
+
+    #[test]
+    fn scrollbar_row_state_tracks_hover_and_pressed_rows() {
+        let scrollbar = RenderedScrollbar {
+            first_visible_row: 0,
+            visible_rows: 2,
+            total_rows: 5,
+            hovered_row: Some(0),
+            pressed: false,
+        };
+        assert_eq!(
+            scrollbar.row_state(0),
+            RenderedScrollbarRowState {
+                thumb: true,
+                hovered: true,
+                pressed: false,
+            }
+        );
+        assert_eq!(
+            scrollbar.row_state(1),
+            RenderedScrollbarRowState {
+                thumb: false,
+                hovered: false,
+                pressed: false,
+            }
+        );
+
+        let scrollbar = RenderedScrollbar {
+            first_visible_row: 0,
+            visible_rows: 2,
+            total_rows: 5,
+            hovered_row: Some(1),
+            pressed: true,
+        };
+        assert_eq!(
+            scrollbar.row_state(1),
+            RenderedScrollbarRowState {
+                thumb: false,
+                hovered: true,
+                pressed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn scrollbar_hit_testing_uses_render_track_geometry() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4").into_handle(),
+        );
+        let view = EditorView::new(editor).with_viewport_rows(2);
+        let track_x = scrollbar_track_left() + px(3.0);
+        let first_row_y = EDITOR_PADDING + HEADER_HEIGHT;
+        let second_row_y = first_row_y + LINE_HEIGHT;
+
+        assert_eq!(
+            view.scrollbar_hit_for_position(Point {
+                x: track_x,
+                y: first_row_y,
+            }),
+            Some(ScrollbarHit {
+                visible_row: 0,
+                thumb_rows: 0..1,
+            })
+        );
+        assert_eq!(
+            view.scrollbar_hit_for_position(Point {
+                x: track_x,
+                y: second_row_y,
+            }),
+            Some(ScrollbarHit {
+                visible_row: 1,
+                thumb_rows: 0..1,
+            })
+        );
+        assert_eq!(
+            view.scrollbar_hit_for_position(Point {
+                x: scrollbar_track_left() - px(1.0),
+                y: first_row_y,
+            }),
+            None
+        );
+        assert_eq!(
+            view.scrollbar_hit_for_position(Point {
+                x: track_x,
+                y: second_row_y + LINE_HEIGHT,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn scrollbar_row_mapping_updates_viewport() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4\n5").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(2);
+
+        view.scroll_viewport_to_scrollbar_row(1, 0);
+        assert_eq!(view.viewport_start_row(), 4);
+        assert_eq!(
+            view.rendered_editor(None).scrollbar.unwrap().thumb_rows(),
+            1..2
+        );
+
+        view.scroll_viewport_to_scrollbar_row(0, 0);
+        assert_eq!(view.viewport_start_row(), 0);
+        assert_eq!(
+            view.rendered_editor(None).scrollbar.unwrap().thumb_rows(),
+            0..1
+        );
+    }
+
+    #[test]
+    fn scrollbar_pixel_mapping_updates_viewport_between_visible_rows() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(
+                BufferId::new(1).unwrap(),
+                "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11",
+            )
+            .into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(4);
+
+        view.scroll_viewport_to_scrollbar_y(scrollbar_track_top() + px(5.0), Pixels::ZERO);
+        assert_eq!(view.viewport_start_row(), 1);
+
+        view.scroll_viewport_to_scrollbar_y(scrollbar_track_top() + px(15.0), Pixels::ZERO);
+        assert_eq!(view.viewport_start_row(), 3);
+
+        view.scroll_viewport_to_scrollbar_y(scrollbar_track_top() - px(10.0), Pixels::ZERO);
+        assert_eq!(view.viewport_start_row(), 0);
+
+        view.scroll_viewport_to_scrollbar_y(scrollbar_track_top() + px(100.0), Pixels::ZERO);
+        assert_eq!(view.viewport_start_row(), 8);
     }
 
     #[test]
@@ -1894,6 +2562,53 @@ mod tests {
     }
 
     #[test]
+    fn cancel_clears_selection_and_transient_interaction_state() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcdefghi").into_handle(),
+        );
+        let mut view = EditorView::new(editor);
+        view.editor.select_anchor_heads(vec![(0, 3), (8, 5)]);
+        view.editor.set_active_selection_index(1).unwrap();
+        view.marked_range = Some(1..2);
+        view.selecting_with_mouse = true;
+        view.drag_autoscroll = Some(DragAutoscroll {
+            position: Point {
+                x: EDITOR_PADDING,
+                y: EDITOR_PADDING,
+            },
+            generation: 7,
+        });
+        view.scrollbar_drag = Some(ScrollbarDrag {
+            thumb_grab_offset: px(3.0),
+        });
+        view.scrollbar_track_press = Some(ScrollbarTrackPress {
+            direction: 1,
+            generation: 11,
+        });
+
+        assert_eq!(
+            view.dispatch_command(EditorCommand::Cancel).unwrap(),
+            CommandOutcome {
+                changed_text: false,
+                moved_cursor: true,
+            }
+        );
+
+        assert_eq!(view.marked_range, None);
+        assert!(!view.selecting_with_mouse);
+        assert_eq!(view.drag_autoscroll, None);
+        assert_eq!(view.scrollbar_drag, None);
+        assert_eq!(view.scrollbar_track_press, None);
+        assert_eq!(view.editor.active_selection_index(), 1);
+        assert_eq!(view.editor.selected_text(), "");
+        assert_eq!(
+            view.rendered_lines(None)[0].text_with_overlays(),
+            "abc|de|fghi"
+        );
+    }
+
+    #[test]
     fn keystrokes_map_to_editing_commands() {
         assert_eq!(
             command_for_keystroke(&Keystroke::parse("backspace").unwrap()),
@@ -1930,6 +2645,10 @@ mod tests {
         assert_eq!(
             command_for_keystroke(&Keystroke::parse("enter").unwrap()),
             Some(EditorCommand::InsertText("\n"))
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("escape").unwrap()),
+            Some(EditorCommand::Cancel)
         );
         assert_eq!(
             command_for_keystroke(&Keystroke::parse("secondary-a").unwrap()),
@@ -2340,6 +3059,34 @@ mod tests {
     }
 
     #[gpui::test]
+    fn gpui_escape_cancels_active_selection(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcdef").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        view.update(cx, |view, _| view.editor.select(1..4));
+
+        cx.simulate_keystrokes("escape");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abcdef");
+            assert_eq!(view.editor.selected_text(), "");
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "abcd|ef");
+        });
+    }
+
+    #[gpui::test]
     fn gpui_keyboard_line_document_and_word_navigation(cx: &mut gpui::TestAppContext) {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -2443,6 +3190,312 @@ mod tests {
         );
         view.update(cx, |view, _| {
             assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|1");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_scrollbar_hover_and_pressed_state_reach_render_model(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4\n5").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle).with_viewport_rows(2)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        let track_x = scrollbar_track_left() + SCROLLBAR_WIDTH / 2.0;
+        let first_row_y = EDITOR_PADDING + HEADER_HEIGHT;
+
+        cx.simulate_mouse_move(
+            Point {
+                x: track_x,
+                y: first_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            let scrollbar = view.rendered_editor(None).scrollbar.unwrap();
+            assert_eq!(scrollbar.hovered_row, Some(0));
+            assert!(!scrollbar.pressed);
+            assert_eq!(
+                scrollbar.row_state(0),
+                RenderedScrollbarRowState {
+                    thumb: true,
+                    hovered: true,
+                    pressed: false,
+                }
+            );
+        });
+
+        cx.simulate_mouse_down(
+            Point {
+                x: track_x,
+                y: first_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            let scrollbar = view.rendered_editor(None).scrollbar.unwrap();
+            assert_eq!(scrollbar.hovered_row, Some(0));
+            assert!(scrollbar.pressed);
+            assert_eq!(
+                scrollbar.row_state(0),
+                RenderedScrollbarRowState {
+                    thumb: true,
+                    hovered: true,
+                    pressed: true,
+                }
+            );
+        });
+
+        cx.simulate_mouse_up(
+            Point {
+                x: track_x,
+                y: first_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            let scrollbar = view.rendered_editor(None).scrollbar.unwrap();
+            assert_eq!(scrollbar.hovered_row, Some(0));
+            assert!(!scrollbar.pressed);
+            assert_eq!(view.scrollbar_drag, None);
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_scrollbar_track_clicks_page_viewport(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4\n5").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle).with_viewport_rows(2)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        let track_x = scrollbar_track_left() + SCROLLBAR_WIDTH / 2.0;
+        let first_row_y = EDITOR_PADDING + HEADER_HEIGHT;
+        let second_row_y = first_row_y + LINE_HEIGHT;
+
+        cx.simulate_mouse_down(
+            Point {
+                x: track_x,
+                y: second_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: track_x,
+                y: second_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 2);
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.scrollbar_drag, None);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "2");
+        });
+
+        view.update(cx, |view, _| view.scroll_viewport_to_scrollbar_row(1, 0));
+        cx.simulate_mouse_down(
+            Point {
+                x: track_x,
+                y: first_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: track_x,
+                y: first_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 2);
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.scrollbar_drag, None);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "2");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_scrollbar_track_hold_repeats_page_viewport(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(
+                BufferId::new(1).unwrap(),
+                "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11",
+            )
+            .into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle).with_viewport_rows(2)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        let track_x = scrollbar_track_left() + SCROLLBAR_WIDTH / 2.0;
+        let second_row_y = EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT;
+
+        cx.simulate_mouse_down(
+            Point {
+                x: track_x,
+                y: second_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 2);
+            assert_eq!(
+                view.scrollbar_track_press,
+                Some(ScrollbarTrackPress {
+                    direction: 1,
+                    generation: 1,
+                })
+            );
+            assert!(view.rendered_editor(None).scrollbar.unwrap().pressed);
+        });
+
+        let press = view.update(cx, |view, _| view.scrollbar_track_press.unwrap());
+        view.update(cx, |view, _| {
+            assert!(view.repeat_scrollbar_track_press(press));
+        });
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 4);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "4");
+        });
+
+        view.update(cx, |view, _| {
+            assert!(view.repeat_scrollbar_track_press(press));
+        });
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 6);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "6");
+        });
+
+        cx.simulate_mouse_up(
+            Point {
+                x: track_x,
+                y: second_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.scrollbar_track_press, None);
+            assert!(!view.rendered_editor(None).scrollbar.unwrap().pressed);
+        });
+
+        view.update(cx, |view, _| {
+            assert!(!view.repeat_scrollbar_track_press(press));
+        });
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 6);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "6");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_scrollbar_drag_uses_pixel_position(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(
+                BufferId::new(1).unwrap(),
+                "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11",
+            )
+            .into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle).with_viewport_rows(4)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        let track_x = scrollbar_track_left() + SCROLLBAR_WIDTH / 2.0;
+        let track_top = scrollbar_track_top();
+
+        cx.simulate_mouse_down(
+            Point {
+                x: track_x,
+                y: track_top,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: track_x,
+                y: track_top + px(5.0),
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 1);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "1");
+        });
+
+        cx.simulate_mouse_move(
+            Point {
+                x: track_x,
+                y: track_top + px(15.0),
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: track_x,
+                y: track_top + px(15.0),
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.viewport_start_row(), 3);
+            assert_eq!(view.scrollbar_drag, None);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "3");
         });
     }
 
@@ -2579,6 +3632,85 @@ mod tests {
             assert!(!view.selecting_with_mouse);
             assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[bc]");
             assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[de]|f");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_mouse_drag_autoscroll_repeats_while_outside_viewport(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4\n5").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle).with_viewport_rows(2)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        let text_x = EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP;
+        let first_row_y = EDITOR_PADDING + HEADER_HEIGHT;
+        let below_viewport_y = first_row_y + LINE_HEIGHT * 3;
+
+        cx.simulate_mouse_down(
+            Point {
+                x: text_x,
+                y: first_row_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: text_x,
+                y: below_viewport_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        let autoscroll = view.update(cx, |view, _| {
+            assert!(view.selecting_with_mouse);
+            assert_eq!(view.viewport_start_row(), 1);
+            assert_eq!(view.editor.selected_text(), "0\n1\n");
+            view.drag_autoscroll.unwrap()
+        });
+        assert_eq!(
+            autoscroll,
+            DragAutoscroll {
+                position: Point {
+                    x: text_x,
+                    y: below_viewport_y,
+                },
+                generation: 1,
+            }
+        );
+
+        view.update(cx, |view, _| {
+            assert!(view.repeat_drag_autoscroll(autoscroll.generation).unwrap());
+            assert_eq!(view.viewport_start_row(), 2);
+            assert_eq!(view.editor.selected_text(), "0\n1\n2\n");
+        });
+
+        cx.simulate_mouse_up(
+            Point {
+                x: text_x,
+                y: below_viewport_y,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.drag_autoscroll, None);
+            assert!(!view.repeat_drag_autoscroll(autoscroll.generation).unwrap());
+            assert_eq!(view.viewport_start_row(), 2);
+            assert_eq!(view.editor.selected_text(), "0\n1\n2\n");
         });
     }
 
