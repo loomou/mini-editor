@@ -2,11 +2,19 @@ use editor::EditorModel;
 use std::ops::Range;
 
 use gpui::{
-    App, Application, Bounds, Context, Element, ElementId, ElementInputHandler, Entity,
-    FocusHandle, GlobalElementId, InspectorElementId, IntoElement, KeyDownEvent, Keystroke,
-    LayoutId, Modifiers, MouseButton, Pixels, Render, Style, UTF16Selection, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, rgb, size,
+    App, Application, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
+    Entity, FocusHandle, GlobalElementId, InspectorElementId, IntoElement, KeyDownEvent, Keystroke,
+    LayoutId, Modifiers, MouseButton, MouseDownEvent, Pixels, Point, Render, Style, UTF16Selection,
+    Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
+
+const DEFAULT_SOFT_WRAP_COLUMN: usize = 100;
+const EDITOR_PADDING: Pixels = px(16.0);
+const HEADER_HEIGHT: Pixels = px(28.0);
+const LINE_HEIGHT: Pixels = px(20.0);
+const LINE_NUMBER_WIDTH: Pixels = px(48.0);
+const CONTENT_GAP: Pixels = px(12.0);
+const CHARACTER_WIDTH: Pixels = px(8.0);
 
 #[derive(Debug)]
 pub struct EditorView {
@@ -18,12 +26,25 @@ pub struct EditorView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditorCommand {
     InsertChar(char),
+    InsertText(&'static str),
     Backspace,
     Delete,
     Undo,
     Redo,
     MoveLeft { extend: bool },
     MoveRight { extend: bool },
+    MoveUp { extend: bool },
+    MoveDown { extend: bool },
+    MoveToLineStart { extend: bool },
+    MoveToLineEnd { extend: bool },
+    MoveToDocumentStart { extend: bool },
+    MoveToDocumentEnd { extend: bool },
+    MoveToPreviousWord { extend: bool },
+    MoveToNextWord { extend: bool },
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +158,7 @@ impl EditorView {
 
         match command {
             EditorCommand::InsertChar(character) => self.editor.insert_char(character)?,
+            EditorCommand::InsertText(text) => self.editor.insert_text(text)?,
             EditorCommand::Backspace => {
                 self.editor.backspace()?;
             }
@@ -151,6 +173,36 @@ impl EditorView {
             }
             EditorCommand::MoveLeft { extend } => self.editor.move_left(extend)?,
             EditorCommand::MoveRight { extend } => self.editor.move_right(extend)?,
+            EditorCommand::MoveUp { extend } => {
+                self.editor
+                    .move_up(extend, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
+            }
+            EditorCommand::MoveDown { extend } => {
+                self.editor
+                    .move_down(extend, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
+            }
+            EditorCommand::MoveToLineStart { extend } => {
+                self.editor
+                    .move_to_line_start(extend, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
+            }
+            EditorCommand::MoveToLineEnd { extend } => {
+                self.editor
+                    .move_to_line_end(extend, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
+            }
+            EditorCommand::MoveToDocumentStart { extend } => {
+                self.editor.move_to_document_start(extend)?;
+            }
+            EditorCommand::MoveToDocumentEnd { extend } => {
+                self.editor.move_to_document_end(extend)?;
+            }
+            EditorCommand::MoveToPreviousWord { extend } => {
+                self.editor.move_to_previous_word(extend)?;
+            }
+            EditorCommand::MoveToNextWord { extend } => {
+                self.editor.move_to_next_word(extend)?;
+            }
+            EditorCommand::SelectAll => self.editor.select_all(),
+            EditorCommand::Copy | EditorCommand::Cut | EditorCommand::Paste => {}
         }
 
         let after_text = self.editor.snapshot().text().to_string();
@@ -190,13 +242,96 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         if let Some(command) = command_for_keystroke(&event.keystroke) {
-            match self.dispatch_command(command) {
+            match self.dispatch_context_command(command, cx) {
                 Ok(_) => {
                     cx.notify();
                     cx.stop_propagation();
                 }
                 Err(error) => eprintln!("mini_ui command failed: {error}"),
             }
+        }
+    }
+
+    fn handle_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(focus_handle) = self.focus_handle.as_ref() {
+            focus_handle.focus(window);
+        }
+
+        let (row, column) = display_point_for_mouse_position(event.position);
+        match self.editor.select_display_point(
+            row,
+            column,
+            event.modifiers.shift,
+            Some(DEFAULT_SOFT_WRAP_COLUMN),
+        ) {
+            Ok(()) => {
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Err(error) => eprintln!("mini_ui mouse selection failed: {error}"),
+        }
+    }
+
+    fn dispatch_context_command(
+        &mut self,
+        command: EditorCommand,
+        cx: &mut Context<Self>,
+    ) -> Result<CommandOutcome, String> {
+        match command {
+            EditorCommand::Copy => self.copy_selection_to_clipboard(cx, false),
+            EditorCommand::Cut => Ok(self.copy_selection_to_clipboard(cx, true)?),
+            EditorCommand::Paste => {
+                let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                    return Ok(CommandOutcome {
+                        changed_text: false,
+                        moved_cursor: false,
+                    });
+                };
+                self.dispatch_paste_text(&text)
+            }
+            command => self.dispatch_command(command),
+        }
+    }
+
+    fn dispatch_paste_text(&mut self, text: &str) -> Result<CommandOutcome, String> {
+        let before_text = self.editor.snapshot().text().to_string();
+        let before_selections = selection_state(&self.editor);
+        self.editor.insert_text(text.to_string())?;
+        let after_text = self.editor.snapshot().text().to_string();
+        let after_selections = selection_state(&self.editor);
+        Ok(CommandOutcome {
+            changed_text: before_text != after_text,
+            moved_cursor: before_selections != after_selections,
+        })
+    }
+
+    fn copy_selection_to_clipboard(
+        &mut self,
+        cx: &mut Context<Self>,
+        delete_after_copy: bool,
+    ) -> Result<CommandOutcome, String> {
+        let selected_text = self.editor.selected_text();
+        if selected_text.is_empty() {
+            return Ok(CommandOutcome {
+                changed_text: false,
+                moved_cursor: false,
+            });
+        }
+
+        cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+
+        if delete_after_copy {
+            self.dispatch_command(EditorCommand::Delete)
+        } else {
+            Ok(CommandOutcome {
+                changed_text: false,
+                moved_cursor: false,
+            })
         }
     }
 
@@ -279,6 +414,11 @@ impl EditorView {
                     .iter()
                     .filter(|selection| !selection.is_empty())
                     .filter_map(|selection| {
+                        if selection.end <= row.source_range.start
+                            || selection.start >= row.source_range.end
+                        {
+                            return None;
+                        }
                         let start = selection.start.max(row.source_range.start);
                         let end = selection.end.min(row.source_range.end);
                         (start < end)
@@ -367,6 +507,22 @@ fn availability_label(available: bool) -> &'static str {
     if available { "on" } else { "off" }
 }
 
+fn display_point_for_mouse_position(position: Point<Pixels>) -> (usize, usize) {
+    let row_origin = EDITOR_PADDING + HEADER_HEIGHT;
+    let column_origin = EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP;
+    let row = if position.y <= row_origin {
+        0
+    } else {
+        ((position.y - row_origin) / LINE_HEIGHT).floor() as usize
+    };
+    let column = if position.x <= column_origin {
+        0
+    } else {
+        ((position.x - column_origin) / CHARACTER_WIDTH).round() as usize
+    };
+    (row, column)
+}
+
 fn selection_state(editor: &EditorModel) -> Vec<(usize, usize, usize, bool)> {
     let mut state = editor
         .resolved_selections()
@@ -390,12 +546,41 @@ fn command_for_keystroke(keystroke: &Keystroke) -> Option<EditorCommand> {
     match keystroke.key.as_str() {
         "backspace" if navigation_modifiers(modifiers) => Some(EditorCommand::Backspace),
         "delete" if navigation_modifiers(modifiers) => Some(EditorCommand::Delete),
+        "left" if word_modifiers(modifiers) => Some(EditorCommand::MoveToPreviousWord {
+            extend: modifiers.shift,
+        }),
+        "right" if word_modifiers(modifiers) => Some(EditorCommand::MoveToNextWord {
+            extend: modifiers.shift,
+        }),
         "left" if navigation_modifiers(modifiers) => Some(EditorCommand::MoveLeft {
             extend: modifiers.shift,
         }),
         "right" if navigation_modifiers(modifiers) => Some(EditorCommand::MoveRight {
             extend: modifiers.shift,
         }),
+        "up" if navigation_modifiers(modifiers) => Some(EditorCommand::MoveUp {
+            extend: modifiers.shift,
+        }),
+        "down" if navigation_modifiers(modifiers) => Some(EditorCommand::MoveDown {
+            extend: modifiers.shift,
+        }),
+        "home" if document_modifiers(modifiers) => Some(EditorCommand::MoveToDocumentStart {
+            extend: modifiers.shift,
+        }),
+        "end" if document_modifiers(modifiers) => Some(EditorCommand::MoveToDocumentEnd {
+            extend: modifiers.shift,
+        }),
+        "home" if navigation_modifiers(modifiers) => Some(EditorCommand::MoveToLineStart {
+            extend: modifiers.shift,
+        }),
+        "end" if navigation_modifiers(modifiers) => Some(EditorCommand::MoveToLineEnd {
+            extend: modifiers.shift,
+        }),
+        "enter" if navigation_modifiers(modifiers) => Some(EditorCommand::InsertText("\n")),
+        "a" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::SelectAll),
+        "c" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Copy),
+        "x" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Cut),
+        "v" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Paste),
         "z" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Undo),
         "z" if shortcut_modifiers(modifiers, true) => Some(EditorCommand::Redo),
         "y" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Redo),
@@ -405,6 +590,30 @@ fn command_for_keystroke(keystroke: &Keystroke) -> Option<EditorCommand> {
 
 fn navigation_modifiers(modifiers: Modifiers) -> bool {
     !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.function
+}
+
+fn word_modifiers(modifiers: Modifiers) -> bool {
+    shortcut_navigation_modifiers(modifiers)
+}
+
+fn document_modifiers(modifiers: Modifiers) -> bool {
+    shortcut_navigation_modifiers(modifiers)
+}
+
+fn shortcut_navigation_modifiers(modifiers: Modifiers) -> bool {
+    if modifiers.alt || modifiers.function {
+        return false;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.platform && !modifiers.control
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.control && !modifiers.platform
+    }
 }
 
 fn shortcut_modifiers(modifiers: Modifiers, shift: bool) -> bool {
@@ -563,7 +772,6 @@ impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rendered = self.rendered_editor(Some(100));
         let focus_handle = self.render_focus_handle(cx);
-        let click_focus_handle = focus_handle.clone();
         div()
             .size_full()
             .p_4()
@@ -572,9 +780,7 @@ impl Render for EditorView {
             .key_context("EditorView")
             .track_focus(&focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
-            .on_mouse_down(MouseButton::Left, move |_, window, _| {
-                click_focus_handle.focus(window);
-            })
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
             .child(EditorInputElement {
                 view: cx.entity(),
                 focus_handle: focus_handle.clone(),
@@ -938,6 +1144,82 @@ mod tests {
     }
 
     #[test]
+    fn view_dispatches_enter_up_down_and_select_all_commands() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "ab\ncde").into_handle(),
+        );
+        let mut view = EditorView::new(editor);
+
+        view.dispatch_command(EditorCommand::MoveDown { extend: false })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|cde");
+
+        view.dispatch_command(EditorCommand::MoveRight { extend: false })
+            .unwrap();
+        view.dispatch_command(EditorCommand::MoveRight { extend: false })
+            .unwrap();
+        view.dispatch_command(EditorCommand::MoveUp { extend: true })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "ab|");
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[cd]e");
+
+        view.dispatch_command(EditorCommand::InsertText("\n"))
+            .unwrap();
+        assert_eq!(view.text(), "ab\ne");
+
+        view.dispatch_command(EditorCommand::SelectAll).unwrap();
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[ab]");
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[e]|");
+    }
+
+    #[test]
+    fn view_dispatches_line_document_and_word_navigation_commands() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "one two\nthree_four").into_handle(),
+        );
+        let mut view = EditorView::new(editor);
+
+        view.dispatch_command(EditorCommand::MoveToNextWord { extend: false })
+            .unwrap();
+        assert_eq!(
+            view.rendered_lines(None)[0].text_with_overlays(),
+            "one |two"
+        );
+
+        view.dispatch_command(EditorCommand::MoveToLineEnd { extend: true })
+            .unwrap();
+        assert_eq!(
+            view.rendered_lines(None)[0].text_with_overlays(),
+            "one [two]|"
+        );
+
+        view.dispatch_command(EditorCommand::MoveToDocumentEnd { extend: false })
+            .unwrap();
+        assert_eq!(
+            view.rendered_lines(None)[1].text_with_overlays(),
+            "three_four|"
+        );
+
+        view.dispatch_command(EditorCommand::MoveToPreviousWord { extend: true })
+            .unwrap();
+        assert_eq!(
+            view.rendered_lines(None)[1].text_with_overlays(),
+            "[|three_four]"
+        );
+
+        view.dispatch_command(EditorCommand::MoveToDocumentStart { extend: false })
+            .unwrap();
+        view.dispatch_command(EditorCommand::MoveToLineStart { extend: false })
+            .unwrap();
+        assert_eq!(
+            view.rendered_lines(None)[0].text_with_overlays(),
+            "|one two"
+        );
+    }
+
+    #[test]
     fn view_reports_noop_command_outcomes() {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -973,6 +1255,58 @@ mod tests {
             command_for_keystroke(&Keystroke::parse("shift-right").unwrap()),
             Some(EditorCommand::MoveRight { extend: true })
         );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("up").unwrap()),
+            Some(EditorCommand::MoveUp { extend: false })
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("shift-down").unwrap()),
+            Some(EditorCommand::MoveDown { extend: true })
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("enter").unwrap()),
+            Some(EditorCommand::InsertText("\n"))
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-a").unwrap()),
+            Some(EditorCommand::SelectAll)
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-c").unwrap()),
+            Some(EditorCommand::Copy)
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-x").unwrap()),
+            Some(EditorCommand::Cut)
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-v").unwrap()),
+            Some(EditorCommand::Paste)
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("home").unwrap()),
+            Some(EditorCommand::MoveToLineStart { extend: false })
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("shift-end").unwrap()),
+            Some(EditorCommand::MoveToLineEnd { extend: true })
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-home").unwrap()),
+            Some(EditorCommand::MoveToDocumentStart { extend: false })
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-shift-end").unwrap()),
+            Some(EditorCommand::MoveToDocumentEnd { extend: true })
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-left").unwrap()),
+            Some(EditorCommand::MoveToPreviousWord { extend: false })
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-shift-right").unwrap()),
+            Some(EditorCommand::MoveToNextWord { extend: true })
+        );
     }
 
     #[test]
@@ -994,10 +1328,6 @@ mod tests {
     #[test]
     fn modified_printable_keystrokes_do_not_insert_text() {
         assert_eq!(
-            command_for_keystroke(&Keystroke::parse("secondary-a").unwrap()),
-            None
-        );
-        assert_eq!(
             command_for_keystroke(&Keystroke::parse("alt-a").unwrap()),
             None
         );
@@ -1005,6 +1335,24 @@ mod tests {
         assert_eq!(
             command_for_keystroke(&Keystroke::parse("space").unwrap()),
             None
+        );
+    }
+
+    #[test]
+    fn mouse_positions_map_to_display_points() {
+        assert_eq!(
+            display_point_for_mouse_position(Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            }),
+            (0, 0)
+        );
+        assert_eq!(
+            display_point_for_mouse_position(Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + CHARACTER_WIDTH * 3,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            }),
+            (2, 3)
         );
     }
 
@@ -1076,6 +1424,155 @@ mod tests {
         view.update(cx, |view, _| {
             assert_eq!(view.text(), "abc");
             assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "abc|");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_keyboard_navigation_newline_and_selection(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "ab\ncde").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("down right right shift-up enter secondary-a");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "ab\ne");
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[ab]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[e]|");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_keyboard_line_document_and_word_navigation(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "one two\nthree_four").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        cx.simulate_keystrokes("secondary-right shift-end secondary-end secondary-shift-left");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)[1].text_with_overlays(),
+                "[|three_four]"
+            );
+        });
+
+        cx.simulate_keystrokes("home");
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)[1].text_with_overlays(),
+                "|three_four"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_clipboard_shortcuts_copy_cut_and_paste(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "hello world").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        view.update(cx, |view, _| view.editor.select(0..5));
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("hello".to_string())
+        );
+
+        cx.simulate_keystrokes("secondary-x");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), " world");
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "| world");
+        });
+
+        cx.write_to_clipboard(ClipboardItem::new_string("zed\neditor".to_string()));
+        cx.simulate_keystrokes("secondary-v");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "zed\neditor world");
+            assert_eq!(
+                view.rendered_lines(None)[1].text_with_overlays(),
+                "editor| world"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_mouse_click_moves_cursor_and_shift_click_extends_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\ndef").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + CHARACTER_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "de|f");
+        });
+
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + CHARACTER_WIDTH,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[|bc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[de]f");
         });
     }
 }

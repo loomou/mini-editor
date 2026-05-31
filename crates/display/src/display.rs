@@ -64,6 +64,23 @@ impl DisplaySnapshot {
             })
             .unwrap_or(DisplayPoint { row: 0, column: 0 })
     }
+
+    pub fn source_offset_for_vertical_movement(
+        &self,
+        source_offset: usize,
+        row_delta: isize,
+        desired_column: usize,
+    ) -> usize {
+        let point = self.display_point_for_source_offset(source_offset);
+        let target_row = point
+            .row
+            .saturating_add_signed(row_delta)
+            .min(self.rows.len().saturating_sub(1));
+        self.source_offset_for_display_point(DisplayPoint {
+            row: target_row,
+            column: desired_column,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +173,7 @@ fn next_wrap_boundary(line: &str, start: usize, wrap_column: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use language::Buffer;
     use multibuffer::MultiBuffer;
     use text::BufferId;
 
@@ -187,5 +205,16 @@ mod tests {
             display.display_point_for_source_offset(4),
             DisplayPoint { row: 1, column: 1 }
         );
+    }
+
+    #[test]
+    fn maps_vertical_movement_by_display_column() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "ab\ncdef");
+        let multibuffer = MultiBuffer::singleton("scratch", buffer.into_handle());
+        let display = DisplayMap::new(None).snapshot(&multibuffer.snapshot());
+
+        assert_eq!(display.source_offset_for_vertical_movement(1, 1, 1), 4);
+        assert_eq!(display.source_offset_for_vertical_movement(4, -1, 1), 1);
+        assert_eq!(display.source_offset_for_vertical_movement(1, 10, 5), 7);
     }
 }

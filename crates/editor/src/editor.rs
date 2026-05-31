@@ -8,6 +8,7 @@ use std::rc::Rc;
 pub enum SelectionGoal {
     #[default]
     None,
+    Column(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,6 +266,106 @@ impl EditorModel {
         self.move_active_head(target, extend)
     }
 
+    pub fn move_up(&mut self, extend: bool, soft_wrap_column: Option<usize>) -> Result<(), String> {
+        self.move_vertical(-1, extend, soft_wrap_column)
+    }
+
+    pub fn move_down(
+        &mut self,
+        extend: bool,
+        soft_wrap_column: Option<usize>,
+    ) -> Result<(), String> {
+        self.move_vertical(1, extend, soft_wrap_column)
+    }
+
+    pub fn move_to_line_start(
+        &mut self,
+        extend: bool,
+        soft_wrap_column: Option<usize>,
+    ) -> Result<(), String> {
+        let selection = self.active_selection()?;
+        let display = self.display_snapshot(soft_wrap_column);
+        let point = display.display_point_for_source_offset(selection.head());
+        let target = display
+            .rows()
+            .get(point.row)
+            .map(|row| row.source_range.start)
+            .unwrap_or(0);
+        self.move_active_head(target, extend)
+    }
+
+    pub fn move_to_line_end(
+        &mut self,
+        extend: bool,
+        soft_wrap_column: Option<usize>,
+    ) -> Result<(), String> {
+        let selection = self.active_selection()?;
+        let display = self.display_snapshot(soft_wrap_column);
+        let point = display.display_point_for_source_offset(selection.head());
+        let target = display
+            .rows()
+            .get(point.row)
+            .map(|row| row.source_range.end)
+            .unwrap_or(display.source_len());
+        self.move_active_head(target, extend)
+    }
+
+    pub fn move_to_document_start(&mut self, extend: bool) -> Result<(), String> {
+        self.move_active_head(0, extend)
+    }
+
+    pub fn move_to_document_end(&mut self, extend: bool) -> Result<(), String> {
+        self.move_active_head(self.snapshot().text().len(), extend)
+    }
+
+    pub fn move_to_previous_word(&mut self, extend: bool) -> Result<(), String> {
+        let selection = self.active_selection()?;
+        let text = self.snapshot().text().to_string();
+        let target = previous_word_boundary(&text, selection.head());
+        self.move_active_head(target, extend)
+    }
+
+    pub fn move_to_next_word(&mut self, extend: bool) -> Result<(), String> {
+        let selection = self.active_selection()?;
+        let text = self.snapshot().text().to_string();
+        let target = next_word_boundary(&text, selection.head());
+        self.move_active_head(target, extend)
+    }
+
+    pub fn select_all(&mut self) {
+        let len = self.snapshot().text().len();
+        self.select(0..len);
+    }
+
+    pub fn select_display_point(
+        &mut self,
+        row: usize,
+        column: usize,
+        extend: bool,
+        soft_wrap_column: Option<usize>,
+    ) -> Result<(), String> {
+        let display = self.display_snapshot(soft_wrap_column);
+        let target = display.source_offset_for_display_point(DisplayPoint { row, column });
+        let mut selection = self.active_selection()?;
+        if extend {
+            selection.set_head(target);
+        } else {
+            selection.collapse_to(target);
+        }
+        selection.goal = SelectionGoal::None;
+        self.set_active_selection(selection)
+    }
+
+    pub fn selected_text(&self) -> String {
+        let text = self.snapshot().text().to_string();
+        self.resolved_selections()
+            .into_iter()
+            .filter(|selection| !selection.is_empty())
+            .filter_map(|selection| text.get(selection.range()).map(ToString::to_string))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
     fn move_active_head(&mut self, target: usize, extend: bool) -> Result<(), String> {
         let mut selection = self.active_selection()?;
         if extend {
@@ -274,6 +375,37 @@ impl EditorModel {
         }
         self.set_active_selection(selection)?;
         Ok(())
+    }
+
+    fn move_vertical(
+        &mut self,
+        row_delta: isize,
+        extend: bool,
+        soft_wrap_column: Option<usize>,
+    ) -> Result<(), String> {
+        let selection = self.active_selection()?;
+        let display = self.display_snapshot(soft_wrap_column);
+        let desired_column = match selection.goal {
+            SelectionGoal::Column(column) => column,
+            SelectionGoal::None => {
+                display
+                    .display_point_for_source_offset(selection.head())
+                    .column
+            }
+        };
+        let target = display.source_offset_for_vertical_movement(
+            selection.head(),
+            row_delta,
+            desired_column,
+        );
+        let mut selection = selection;
+        if extend {
+            selection.set_head(target);
+        } else {
+            selection.collapse_to(target);
+        }
+        selection.goal = SelectionGoal::Column(desired_column);
+        self.set_active_selection(selection)
     }
 
     pub fn insert_text(&mut self, text: impl Into<String>) -> Result<(), String> {
@@ -684,9 +816,6 @@ fn resolve_selection_from_anchors(buffer: &MultiBuffer, selection: &Selection) -
     let mut resolved = Selection::from_anchor_head(selection.id, tail, head);
     resolved.goal = selection.goal;
     resolved.set_anchor_handles(tail_anchor, head_anchor);
-    if resolved.is_empty() {
-        resolved.goal = SelectionGoal::None;
-    }
     resolved
 }
 
@@ -745,6 +874,69 @@ fn next_char_boundary(text: &str, offset: usize) -> usize {
         .next()
         .map(|(relative_offset, _)| clipped + relative_offset)
         .unwrap_or(text.len())
+}
+
+fn previous_word_boundary(text: &str, offset: usize) -> usize {
+    let clipped = floor_char_boundary(text, offset);
+    let chars = text[..clipped].char_indices().collect::<Vec<_>>();
+    let Some((mut index, _)) = chars
+        .len()
+        .checked_sub(1)
+        .map(|index| (index, chars[index].1))
+    else {
+        return 0;
+    };
+
+    if is_word_char(chars[index].1) {
+        while index > 0 && is_word_char(chars[index - 1].1) {
+            index -= 1;
+        }
+        return chars[index].0;
+    }
+
+    while index > 0 && !is_word_char(chars[index].1) {
+        index -= 1;
+    }
+    if !is_word_char(chars[index].1) {
+        return 0;
+    }
+    while index > 0 && is_word_char(chars[index - 1].1) {
+        index -= 1;
+    }
+    chars[index].0
+}
+
+fn next_word_boundary(text: &str, offset: usize) -> usize {
+    let mut clipped = floor_char_boundary(text, offset);
+    if clipped >= text.len() {
+        return text.len();
+    }
+
+    while clipped < text.len() {
+        let Some(character) = text[clipped..].chars().next() else {
+            return text.len();
+        };
+        if !is_word_char(character) {
+            break;
+        }
+        clipped += character.len_utf8();
+    }
+
+    while clipped < text.len() {
+        let Some(character) = text[clipped..].chars().next() else {
+            return text.len();
+        };
+        if is_word_char(character) {
+            break;
+        }
+        clipped += character.len_utf8();
+    }
+
+    clipped
+}
+
+fn is_word_char(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
 }
 
 #[cfg(test)]
@@ -986,6 +1178,107 @@ mod tests {
 
         editor.move_left(false).unwrap();
         assert_eq!(editor.cursor_offset().unwrap(), 1);
+    }
+
+    #[test]
+    fn vertical_movement_preserves_column_goal() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd\nef\nghij");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(3..3);
+        editor.move_down(false, None).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 7..7);
+
+        editor.move_down(false, None).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 11..11);
+    }
+
+    #[test]
+    fn vertical_movement_extends_selection() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\ndef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(1..1);
+        editor.move_down(true, None).unwrap();
+
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 1..5);
+        assert!(!selection.reversed);
+    }
+
+    #[test]
+    fn line_boundary_movement_uses_display_rows() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(4..4);
+        editor.move_to_line_start(false, Some(3)).unwrap();
+        assert_eq!(editor.cursor_offset().unwrap(), 3);
+
+        editor.select(4..4);
+        editor.move_to_line_end(true, Some(3)).unwrap();
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 4..6);
+        assert_eq!(selection.head(), 6);
+    }
+
+    #[test]
+    fn document_boundary_movement_can_extend_selection() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\ndef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(5..5);
+        editor.move_to_document_start(true).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 0..5);
+        assert!(editor.resolved_selections()[0].reversed);
+
+        editor.move_to_document_end(false).unwrap();
+        assert_eq!(editor.cursor_offset().unwrap(), 7);
+    }
+
+    #[test]
+    fn word_boundary_movement_skips_punctuation_and_respects_utf8() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one, two_é three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(0..0);
+        editor.move_to_next_word(false).unwrap();
+        assert_eq!(editor.cursor_offset().unwrap(), 5);
+
+        editor.move_to_next_word(false).unwrap();
+        assert_eq!(editor.cursor_offset().unwrap(), 12);
+
+        editor.move_to_previous_word(true).unwrap();
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 5..12);
+        assert!(selection.reversed);
+    }
+
+    #[test]
+    fn select_all_and_selected_text_use_current_buffer() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello\nworld");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_all();
+
+        assert_eq!(editor.resolved_selections()[0].range(), 0..11);
+        assert_eq!(editor.selected_text(), "hello\nworld");
+    }
+
+    #[test]
+    fn select_display_point_moves_or_extends_active_selection() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\ndef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_display_point(1, 2, false, None).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 6..6);
+
+        editor.select_display_point(0, 1, true, None).unwrap();
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 1..6);
+        assert_eq!(selection.head(), 1);
+        assert_eq!(selection.tail(), 6);
+        assert!(selection.reversed);
     }
 
     #[test]
