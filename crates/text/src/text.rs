@@ -87,8 +87,8 @@ pub struct TextEdit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HistoryEntry {
-    undo: TextEdit,
-    redo: TextEdit,
+    undo: Vec<TextEdit>,
+    redo: Vec<TextEdit>,
 }
 
 #[derive(Debug)]
@@ -135,16 +135,31 @@ impl Buffer {
     }
 
     pub fn edit(&mut self, edit: TextEdit) {
-        let deleted_text = self.text.slice(edit.range.clone());
-        let undo_range = edit.range.start..edit.range.start + edit.replacement.len();
-        let history_entry = HistoryEntry {
-            undo: TextEdit {
+        self.edit_group(vec![edit]);
+    }
+
+    pub fn edit_group(&mut self, edits: Vec<TextEdit>) {
+        if edits.is_empty() {
+            return;
+        }
+
+        let mut undo_edits = Vec::new();
+        for edit in edits.iter().cloned() {
+            let deleted_text = self.text.slice(edit.range.clone());
+            let undo_range = edit.range.start..edit.range.start + edit.replacement.len();
+            undo_edits.push(TextEdit {
                 range: undo_range,
                 replacement: deleted_text,
-            },
-            redo: edit.clone(),
+            });
+            self.apply_edit(edit);
+        }
+
+        undo_edits.reverse();
+        let history_entry = HistoryEntry {
+            undo: undo_edits,
+            redo: edits,
         };
-        self.apply_edit(edit);
+
         self.undo_stack.push(history_entry);
         self.redo_stack.clear();
     }
@@ -161,7 +176,9 @@ impl Buffer {
         let Some(history_entry) = self.undo_stack.pop() else {
             return false;
         };
-        self.apply_edit(history_entry.undo.clone());
+        for edit in history_entry.undo.iter().cloned() {
+            self.apply_edit(edit);
+        }
         self.redo_stack.push(history_entry);
         true
     }
@@ -170,7 +187,9 @@ impl Buffer {
         let Some(history_entry) = self.redo_stack.pop() else {
             return false;
         };
-        self.apply_edit(history_entry.redo.clone());
+        for edit in history_entry.redo.iter().cloned() {
+            self.apply_edit(edit);
+        }
         self.undo_stack.push(history_entry);
         true
     }
@@ -290,5 +309,27 @@ mod tests {
         assert!(buffer.can_redo());
         assert!(buffer.redo());
         assert_eq!(buffer.snapshot().text(), "hello zed");
+    }
+
+    #[test]
+    fn undo_and_redo_reapply_grouped_text_edits() {
+        let mut buffer = Buffer::new(BufferId::new(1).unwrap(), "one two three");
+
+        buffer.edit_group(vec![
+            TextEdit {
+                range: 8..13,
+                replacement: "3".to_string(),
+            },
+            TextEdit {
+                range: 0..3,
+                replacement: "1".to_string(),
+            },
+        ]);
+
+        assert_eq!(buffer.snapshot().text(), "1 two 3");
+        assert!(buffer.undo());
+        assert_eq!(buffer.snapshot().text(), "one two three");
+        assert!(buffer.redo());
+        assert_eq!(buffer.snapshot().text(), "1 two 3");
     }
 }

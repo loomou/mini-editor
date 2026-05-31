@@ -41,6 +41,12 @@ impl MultiBufferAnchor {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiBufferEdit {
+    pub range: Range<usize>,
+    pub replacement: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct MultiBufferSnapshot {
     excerpts: Vec<Excerpt>,
@@ -216,56 +222,64 @@ impl MultiBuffer {
         range: Range<usize>,
         replacement: impl Into<String>,
     ) -> Result<(), String> {
+        self.edit_group(vec![MultiBufferEdit {
+            range,
+            replacement: replacement.into(),
+        }])
+    }
+
+    pub fn edit_group(&mut self, edits: Vec<MultiBufferEdit>) -> Result<(), String> {
         if !self.capability.editable() {
             return Err("multibuffer is read-only".to_string());
         }
-
-        let snapshot = self.snapshot();
-        let start = snapshot
-            .locate(range.start)
-            .ok_or_else(|| "edit start is outside the multibuffer".to_string())?;
-        let end = snapshot
-            .locate(range.end)
-            .ok_or_else(|| "edit end is outside the multibuffer".to_string())?;
-        if start.0 != end.0 {
-            return Err("this teaching step only supports edits inside one excerpt".to_string());
+        if edits.is_empty() {
+            return Ok(());
         }
 
-        let replacement = replacement.into();
-        let replacement_len = replacement.len();
-        let deleted_len = end.1 - start.1;
+        let snapshot = self.snapshot();
+        let mut buffer_id = None;
+        let mut text_edits = Vec::new();
+        let mut excerpt_updates = Vec::new();
+
+        for edit in edits {
+            let start = snapshot
+                .locate(edit.range.start)
+                .ok_or_else(|| "edit start is outside the multibuffer".to_string())?;
+            let end = snapshot
+                .locate(edit.range.end)
+                .ok_or_else(|| "edit end is outside the multibuffer".to_string())?;
+            if start.0 != end.0 {
+                return Err("this teaching step only supports edits inside one excerpt".to_string());
+            }
+            if let Some(buffer_id) = buffer_id {
+                if buffer_id != start.0 {
+                    return Err(
+                        "this teaching step only supports grouped edits in one buffer".to_string(),
+                    );
+                }
+            } else {
+                buffer_id = Some(start.0);
+            }
+
+            let replacement_len = edit.replacement.len();
+            let deleted_len = end.1 - start.1;
+            text_edits.push(TextEdit {
+                range: start.1..end.1,
+                replacement: edit.replacement,
+            });
+            excerpt_updates.push((start.0, start.1..end.1, replacement_len, deleted_len));
+        }
+
+        let buffer_id = buffer_id.ok_or_else(|| "edit group has no edits".to_string())?;
 
         let buffer = self
             .buffers
-            .get_mut(&start.0)
+            .get_mut(&buffer_id)
             .ok_or_else(|| "buffer disappeared".to_string())?;
-        buffer.borrow_mut().edit(TextEdit {
-            range: start.1..end.1,
-            replacement,
-        })?;
+        buffer.borrow_mut().edit_group(text_edits)?;
 
-        if replacement_len >= deleted_len {
-            let delta = replacement_len - deleted_len;
-            for excerpt in &mut self.excerpts {
-                if excerpt.buffer_id == start.0
-                    && excerpt.range.context.start <= start.1
-                    && excerpt.range.context.end >= end.1
-                {
-                    excerpt.range.context.end += delta;
-                    excerpt.range.primary.end += delta;
-                }
-            }
-        } else {
-            let delta = deleted_len - replacement_len;
-            for excerpt in &mut self.excerpts {
-                if excerpt.buffer_id == start.0
-                    && excerpt.range.context.start <= start.1
-                    && excerpt.range.context.end >= end.1
-                {
-                    excerpt.range.context.end -= delta;
-                    excerpt.range.primary.end -= delta;
-                }
-            }
+        for (buffer_id, range, replacement_len, deleted_len) in excerpt_updates {
+            self.adjust_excerpts_after_edit(buffer_id, range, replacement_len, deleted_len);
         }
 
         Ok(())
@@ -341,6 +355,38 @@ impl MultiBuffer {
         let len = buffer.borrow().snapshot().text.len();
         excerpt.range = ExcerptRange::new(0..len);
     }
+
+    fn adjust_excerpts_after_edit(
+        &mut self,
+        buffer_id: BufferId,
+        range: Range<usize>,
+        replacement_len: usize,
+        deleted_len: usize,
+    ) {
+        if replacement_len >= deleted_len {
+            let delta = replacement_len - deleted_len;
+            for excerpt in &mut self.excerpts {
+                if excerpt.buffer_id == buffer_id
+                    && excerpt.range.context.start <= range.start
+                    && excerpt.range.context.end >= range.end
+                {
+                    excerpt.range.context.end += delta;
+                    excerpt.range.primary.end += delta;
+                }
+            }
+        } else {
+            let delta = deleted_len - replacement_len;
+            for excerpt in &mut self.excerpts {
+                if excerpt.buffer_id == buffer_id
+                    && excerpt.range.context.start <= range.start
+                    && excerpt.range.context.end >= range.end
+                {
+                    excerpt.range.context.end -= delta;
+                    excerpt.range.primary.end -= delta;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +429,31 @@ mod tests {
 
         assert!(multibuffer.redo().unwrap());
         assert_eq!(multibuffer.snapshot().text(), "hello zed");
+    }
+
+    #[test]
+    fn grouped_edits_undo_and_redo_as_one_entry() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut multibuffer = MultiBuffer::singleton("scratch", buffer.into_handle());
+
+        multibuffer
+            .edit_group(vec![
+                MultiBufferEdit {
+                    range: 8..13,
+                    replacement: "3".to_string(),
+                },
+                MultiBufferEdit {
+                    range: 0..3,
+                    replacement: "1".to_string(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(multibuffer.snapshot().text(), "1 two 3");
+        assert!(multibuffer.undo().unwrap());
+        assert_eq!(multibuffer.snapshot().text(), "one two three");
+        assert!(multibuffer.redo().unwrap());
+        assert_eq!(multibuffer.snapshot().text(), "1 two 3");
     }
 
     #[test]

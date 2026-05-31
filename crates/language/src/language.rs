@@ -149,6 +149,14 @@ impl Buffer {
         Ok(())
     }
 
+    pub fn edit_group(&mut self, edits: Vec<TextEdit>) -> Result<(), String> {
+        if !self.capability.editable() {
+            return Err("buffer is read-only".to_string());
+        }
+        self.text.edit_group(edits);
+        Ok(())
+    }
+
     pub fn undo(&mut self) -> Result<bool, String> {
         if !self.capability.editable() {
             return Err("buffer is read-only".to_string());

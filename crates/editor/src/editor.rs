@@ -1,6 +1,6 @@
 use display::{DisplayMap, DisplayPoint, DisplaySnapshot};
 use language::BufferHandle;
-use multibuffer::{MultiBuffer, MultiBufferAnchor, MultiBufferSnapshot};
+use multibuffer::{MultiBuffer, MultiBufferAnchor, MultiBufferEdit, MultiBufferSnapshot};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,6 +112,8 @@ pub struct EditorModel {
     buffer: MultiBuffer,
     selections: Vec<Selection>,
     active_selection_index: usize,
+    selection_undo_stack: Vec<SelectionHistoryEntry>,
+    selection_redo_stack: Vec<SelectionHistoryEntry>,
 }
 
 impl EditorModel {
@@ -124,6 +126,8 @@ impl EditorModel {
             buffer,
             selections: vec![selection],
             active_selection_index: 0,
+            selection_undo_stack: Vec::new(),
+            selection_redo_stack: Vec::new(),
         }
     }
 
@@ -226,6 +230,14 @@ impl EditorModel {
             .display_point_for_source_offset(cursor))
     }
 
+    pub fn cursor_display_points(&self, soft_wrap_column: Option<usize>) -> Vec<DisplayPoint> {
+        let display = self.display_snapshot(soft_wrap_column);
+        self.resolved_selections()
+            .into_iter()
+            .map(|selection| display.display_point_for_source_offset(selection.head()))
+            .collect()
+    }
+
     pub fn move_left(&mut self, extend: bool) -> Result<(), String> {
         let selection = self.active_selection()?;
 
@@ -266,6 +278,8 @@ impl EditorModel {
     pub fn insert_text(&mut self, text: impl Into<String>) -> Result<(), String> {
         let replacement = text.into();
         let selections = self.resolved_selections();
+        let undo_selections = selections.clone();
+        let undo_active_selection_index = self.active_selection_index;
         let sorted_selections = sorted_non_overlapping_selections(selections.clone())?;
         let replacement_len = isize::try_from(replacement.len())
             .map_err(|_| "replacement text is too large".to_string())?;
@@ -293,11 +307,26 @@ impl EditorModel {
                 })?;
         }
 
-        for (_, selection) in sorted_selections.iter().rev() {
-            self.buffer.edit(selection.range(), replacement.clone())?;
-        }
+        self.buffer.edit_group(
+            sorted_selections
+                .iter()
+                .rev()
+                .map(|(_, selection)| MultiBufferEdit {
+                    range: selection.range(),
+                    replacement: replacement.clone(),
+                })
+                .collect(),
+        )?;
 
+        let redo_selections = next_selections.clone();
+        let redo_active_selection_index = self.active_selection_index;
         self.set_selections_with_active_index(next_selections, self.active_selection_index);
+        self.push_selection_history(
+            undo_selections,
+            undo_active_selection_index,
+            redo_selections,
+            redo_active_selection_index,
+        );
         Ok(())
     }
 
@@ -354,7 +383,14 @@ impl EditorModel {
     pub fn undo(&mut self) -> Result<bool, String> {
         let changed = self.buffer.undo()?;
         if changed {
-            self.sync_selections_to_anchors();
+            if let Some(history_entry) = self.selection_undo_stack.pop() {
+                let selections = history_entry.undo.clone();
+                let active_selection_index = history_entry.undo_active_selection_index;
+                self.set_selections_with_active_index(selections, active_selection_index);
+                self.selection_redo_stack.push(history_entry);
+            } else {
+                self.sync_selections_to_anchors();
+            }
         }
         Ok(changed)
     }
@@ -362,7 +398,14 @@ impl EditorModel {
     pub fn redo(&mut self) -> Result<bool, String> {
         let changed = self.buffer.redo()?;
         if changed {
-            self.sync_selections_to_anchors();
+            if let Some(history_entry) = self.selection_redo_stack.pop() {
+                let selections = history_entry.redo.clone();
+                let active_selection_index = history_entry.redo_active_selection_index;
+                self.set_selections_with_active_index(selections, active_selection_index);
+                self.selection_undo_stack.push(history_entry);
+            } else {
+                self.sync_selections_to_anchors();
+            }
         }
         Ok(changed)
     }
@@ -379,6 +422,8 @@ impl EditorModel {
         }
 
         let sorted_edit_ranges = sorted_non_overlapping_edit_ranges(edit_ranges.clone())?;
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
         let mut next_selections = edit_ranges
             .into_iter()
             .map(|edit_range| edit_range.selection)
@@ -402,15 +447,27 @@ impl EditorModel {
             })?;
         }
 
-        for edit_range in sorted_edit_ranges
-            .iter()
-            .rev()
-            .filter(|edit_range| !edit_range.range.is_empty())
-        {
-            self.buffer.edit(edit_range.range.clone(), "")?;
-        }
+        self.buffer.edit_group(
+            sorted_edit_ranges
+                .iter()
+                .rev()
+                .filter(|edit_range| !edit_range.range.is_empty())
+                .map(|edit_range| MultiBufferEdit {
+                    range: edit_range.range.clone(),
+                    replacement: String::new(),
+                })
+                .collect(),
+        )?;
 
+        let redo_selections = next_selections.clone();
+        let redo_active_selection_index = self.active_selection_index;
         self.set_selections_with_active_index(next_selections, self.active_selection_index);
+        self.push_selection_history(
+            undo_selections,
+            undo_active_selection_index,
+            redo_selections,
+            redo_active_selection_index,
+        );
         Ok(true)
     }
 
@@ -475,6 +532,22 @@ impl EditorModel {
             attach_selection_anchors(buffer, selection);
         }
     }
+
+    fn push_selection_history(
+        &mut self,
+        undo: Vec<Selection>,
+        undo_active_selection_index: usize,
+        redo: Vec<Selection>,
+        redo_active_selection_index: usize,
+    ) {
+        self.selection_undo_stack.push(SelectionHistoryEntry {
+            undo,
+            undo_active_selection_index,
+            redo,
+            redo_active_selection_index,
+        });
+        self.selection_redo_stack.clear();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -482,6 +555,14 @@ struct SelectionEditRange {
     selection_index: usize,
     selection: Selection,
     range: Range<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct SelectionHistoryEntry {
+    undo: Vec<Selection>,
+    undo_active_selection_index: usize,
+    redo: Vec<Selection>,
+    redo_active_selection_index: usize,
 }
 
 fn normalize_new_selections(mut selections: Vec<Selection>) -> Vec<Selection> {
@@ -916,6 +997,22 @@ mod tests {
     }
 
     #[test]
+    fn cursor_display_points_include_all_selection_heads() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_ranges(vec![1..1, 4..4]);
+
+        assert_eq!(
+            editor.cursor_display_points(Some(3)),
+            vec![
+                DisplayPoint { row: 0, column: 1 },
+                DisplayPoint { row: 1, column: 1 },
+            ]
+        );
+    }
+
+    #[test]
     fn display_snapshot_wraps_editor_text() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
         let editor = EditorModel::for_buffer("scratch", buffer.into_handle());
@@ -1004,6 +1101,63 @@ mod tests {
     }
 
     #[test]
+    fn undo_and_redo_restore_batch_insert_selections() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+        editor.set_active_selection_index(0).unwrap();
+
+        editor.insert_text("x").unwrap();
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![1..1, 7..7]
+        );
+
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.snapshot().text(), "one two three");
+        assert_eq!(editor.active_selection_index(), 0);
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 8..13]
+        );
+
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.snapshot().text(), "x two x");
+        assert_eq!(editor.active_selection_index(), 0);
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![1..1, 7..7]
+        );
+    }
+
+    #[test]
+    fn batch_insert_undoes_and_redoes_as_one_transaction() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        editor.insert_text("x").unwrap();
+        assert_eq!(editor.snapshot().text(), "x two x");
+
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.snapshot().text(), "one two three");
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.snapshot().text(), "x two x");
+    }
+
+    #[test]
     fn insertion_rejects_overlapping_selections() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
         let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
@@ -1039,6 +1193,60 @@ mod tests {
             vec![0..0, 5..5]
         );
         assert_eq!(editor.cursor_offset().unwrap(), 5);
+    }
+
+    #[test]
+    fn undo_and_redo_restore_batch_delete_selections() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        assert!(editor.delete().unwrap());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..0, 5..5]
+        );
+
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.snapshot().text(), "one two three");
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 8..13]
+        );
+
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.snapshot().text(), " two ");
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..0, 5..5]
+        );
+    }
+
+    #[test]
+    fn batch_delete_undoes_and_redoes_as_one_transaction() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "one two three");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select_ranges(vec![0..3, 8..13]);
+
+        assert!(editor.delete().unwrap());
+        assert_eq!(editor.snapshot().text(), " two ");
+
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.snapshot().text(), "one two three");
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.snapshot().text(), " two ");
     }
 
     #[test]
