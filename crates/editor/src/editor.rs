@@ -1898,6 +1898,36 @@ mod tests {
     }
 
     #[test]
+    fn vertical_movement_extends_selection_through_empty_lines() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(3..3);
+        editor.move_down(true, None).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 3..5);
+
+        editor.move_down(true, None).unwrap();
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 3..9);
+        assert!(!selection.reversed);
+    }
+
+    #[test]
+    fn vertical_movement_extends_reversed_selection_through_empty_lines() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(9..9);
+        editor.move_up(true, None).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 5..9);
+
+        editor.move_up(true, None).unwrap();
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 3..9);
+        assert!(selection.reversed);
+    }
+
+    #[test]
     fn line_boundary_movement_uses_display_rows() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdef");
         let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
@@ -1973,6 +2003,50 @@ mod tests {
     }
 
     #[test]
+    fn select_display_point_extends_to_clamped_empty_and_short_lines() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_display_point(0, 0, false, None).unwrap();
+        editor.select_display_point(1, 8, true, None).unwrap();
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 0..4);
+        assert_eq!(selection.head(), 4);
+        assert_eq!(selection.tail(), 0);
+        assert!(!selection.reversed);
+
+        editor.select_display_point(0, 0, false, None).unwrap();
+        editor.select_display_point(2, 8, true, None).unwrap();
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 0..7);
+        assert_eq!(selection.head(), 7);
+        assert_eq!(selection.tail(), 0);
+        assert!(!selection.reversed);
+    }
+
+    #[test]
+    fn select_display_point_extends_reversed_to_clamped_empty_and_short_lines() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy\nzz");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_display_point(3, 2, false, None).unwrap();
+        editor.select_display_point(1, 8, true, None).unwrap();
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 4..10);
+        assert_eq!(selection.head(), 4);
+        assert_eq!(selection.tail(), 10);
+        assert!(selection.reversed);
+
+        editor.select_display_point(3, 2, false, None).unwrap();
+        editor.select_display_point(2, 8, true, None).unwrap();
+        let selection = &editor.resolved_selections()[0];
+        assert_eq!(selection.range(), 7..10);
+        assert_eq!(selection.head(), 7);
+        assert_eq!(selection.tail(), 10);
+        assert!(selection.reversed);
+    }
+
+    #[test]
     fn select_display_rectangle_selects_ranges_per_display_row() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd\nef\nghij");
         let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
@@ -1989,6 +2063,44 @@ mod tests {
         );
         assert_eq!(editor.active_selection_index(), 2);
         assert_eq!(editor.selected_text(), "bcfhi");
+    }
+
+    #[test]
+    fn select_display_rectangle_clamps_empty_and_short_lines() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_display_rectangle(0, 0, 2, 8, None);
+
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 4..4, 5..7]
+        );
+        assert_eq!(editor.active_selection_index(), 2);
+        assert_eq!(editor.selected_text(), "abcxy");
+    }
+
+    #[test]
+    fn select_display_rectangle_clamps_reversed_empty_and_short_lines() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_display_rectangle(2, 8, 0, 0, None);
+
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 4..4, 5..7]
+        );
+        assert_eq!(editor.active_selection_index(), 2);
+        assert_eq!(editor.selected_text(), "abcxy");
     }
 
     #[test]
