@@ -109,6 +109,12 @@ impl Selection {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectionHistoryCheckpoint {
+    selections: Vec<Selection>,
+    active_selection_index: usize,
+}
+
 #[derive(Debug)]
 pub struct EditorModel {
     buffer: MultiBuffer,
@@ -116,6 +122,8 @@ pub struct EditorModel {
     active_selection_index: usize,
     selection_undo_stack: Vec<SelectionHistoryEntry>,
     selection_redo_stack: Vec<SelectionHistoryEntry>,
+    selection_only_undo_stack: Vec<SelectionHistoryEntry>,
+    selection_only_redo_stack: Vec<SelectionHistoryEntry>,
 }
 
 impl EditorModel {
@@ -130,6 +138,8 @@ impl EditorModel {
             active_selection_index: 0,
             selection_undo_stack: Vec::new(),
             selection_redo_stack: Vec::new(),
+            selection_only_undo_stack: Vec::new(),
+            selection_only_redo_stack: Vec::new(),
         }
     }
 
@@ -195,6 +205,29 @@ impl EditorModel {
     }
 
     pub fn select_ranges(&mut self, ranges: Vec<Range<usize>>) {
+        self.select_ranges_impl(ranges, true);
+    }
+
+    pub fn selection_history_checkpoint(&self) -> SelectionHistoryCheckpoint {
+        SelectionHistoryCheckpoint {
+            selections: self.resolved_selections(),
+            active_selection_index: self.active_selection_index,
+        }
+    }
+
+    pub fn commit_selection_only_history_from_checkpoint(
+        &mut self,
+        checkpoint: SelectionHistoryCheckpoint,
+    ) {
+        self.push_selection_only_history_from_current(
+            checkpoint.selections,
+            checkpoint.active_selection_index,
+        );
+    }
+
+    fn select_ranges_impl(&mut self, ranges: Vec<Range<usize>>, record_history: bool) {
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
         let text = self.snapshot().text().to_string();
         let selections = ranges
             .into_iter()
@@ -206,6 +239,12 @@ impl EditorModel {
             })
             .collect();
         self.set_selections(normalize_new_selections(selections));
+        if record_history {
+            self.push_selection_only_history_from_current(
+                undo_selections,
+                undo_active_selection_index,
+            );
+        }
     }
 
     pub fn select_anchor_head(&mut self, anchor: usize, head: usize) {
@@ -213,6 +252,8 @@ impl EditorModel {
     }
 
     pub fn select_anchor_heads(&mut self, anchor_heads: Vec<(usize, usize)>) {
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
         let text = self.snapshot().text().to_string();
         let selections = anchor_heads
             .into_iter()
@@ -226,6 +267,7 @@ impl EditorModel {
             })
             .collect();
         self.set_selections(normalize_new_selections(selections));
+        self.push_selection_only_history_from_current(undo_selections, undo_active_selection_index);
     }
 
     pub fn select_display_rectangle(
@@ -235,6 +277,43 @@ impl EditorModel {
         head_row: usize,
         head_column: usize,
         soft_wrap_column: Option<usize>,
+    ) {
+        self.select_display_rectangle_impl(
+            anchor_row,
+            anchor_column,
+            head_row,
+            head_column,
+            soft_wrap_column,
+            true,
+        );
+    }
+
+    pub fn select_display_rectangle_transient(
+        &mut self,
+        anchor_row: usize,
+        anchor_column: usize,
+        head_row: usize,
+        head_column: usize,
+        soft_wrap_column: Option<usize>,
+    ) {
+        self.select_display_rectangle_impl(
+            anchor_row,
+            anchor_column,
+            head_row,
+            head_column,
+            soft_wrap_column,
+            false,
+        );
+    }
+
+    fn select_display_rectangle_impl(
+        &mut self,
+        anchor_row: usize,
+        anchor_column: usize,
+        head_row: usize,
+        head_column: usize,
+        soft_wrap_column: Option<usize>,
+        record_history: bool,
     ) {
         let display = self.display_snapshot(soft_wrap_column);
         let row_start = anchor_row.min(head_row);
@@ -257,7 +336,7 @@ impl EditorModel {
                 start..end
             })
             .collect();
-        self.select_ranges(ranges);
+        self.select_ranges_impl(ranges, record_history);
     }
 
     pub fn add_caret_at_display_point(
@@ -271,6 +350,17 @@ impl EditorModel {
         self.add_caret(offset);
     }
 
+    pub fn add_caret_at_display_point_transient(
+        &mut self,
+        row: usize,
+        column: usize,
+        soft_wrap_column: Option<usize>,
+    ) {
+        let display = self.display_snapshot(soft_wrap_column);
+        let offset = display.source_offset_for_display_point(DisplayPoint { row, column });
+        self.add_caret_impl(offset, false);
+    }
+
     pub fn add_caret_above(&mut self, soft_wrap_column: Option<usize>) -> Result<(), String> {
         self.add_caret_vertically(-1, soft_wrap_column)
     }
@@ -280,6 +370,12 @@ impl EditorModel {
     }
 
     pub fn add_caret(&mut self, offset: usize) {
+        self.add_caret_impl(offset, true);
+    }
+
+    fn add_caret_impl(&mut self, offset: usize, record_history: bool) {
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
         let text = self.snapshot().text().to_string();
         let offset = floor_char_boundary(&text, offset);
         let mut selections = self.resolved_selections();
@@ -295,6 +391,12 @@ impl EditorModel {
             })
             .unwrap_or_else(|| normalized.len().saturating_sub(1));
         self.set_selections_with_active_index(normalized, active_selection_index);
+        if record_history {
+            self.push_selection_only_history_from_current(
+                undo_selections,
+                undo_active_selection_index,
+            );
+        }
     }
 
     fn add_caret_vertically(
@@ -337,7 +439,13 @@ impl EditorModel {
         let selection = self.active_selection()?;
 
         if !extend && !selection.is_empty() {
+            let undo_selections = self.resolved_selections();
+            let undo_active_selection_index = self.active_selection_index;
             self.set_active_selection(Selection::caret(selection.start))?;
+            self.push_selection_only_history_from_current(
+                undo_selections,
+                undo_active_selection_index,
+            );
             return Ok(());
         }
 
@@ -350,7 +458,13 @@ impl EditorModel {
         let selection = self.active_selection()?;
 
         if !extend && !selection.is_empty() {
+            let undo_selections = self.resolved_selections();
+            let undo_active_selection_index = self.active_selection_index;
             self.set_active_selection(Selection::caret(selection.end))?;
+            self.push_selection_only_history_from_current(
+                undo_selections,
+                undo_active_selection_index,
+            );
             return Ok(());
         }
 
@@ -369,6 +483,15 @@ impl EditorModel {
         soft_wrap_column: Option<usize>,
     ) -> Result<(), String> {
         self.move_vertical(1, extend, soft_wrap_column)
+    }
+
+    pub fn move_display_rows(
+        &mut self,
+        row_delta: isize,
+        extend: bool,
+        soft_wrap_column: Option<usize>,
+    ) -> Result<(), String> {
+        self.move_vertical(row_delta, extend, soft_wrap_column)
     }
 
     pub fn move_to_line_start(
@@ -437,8 +560,31 @@ impl EditorModel {
         extend: bool,
         soft_wrap_column: Option<usize>,
     ) -> Result<(), String> {
+        self.select_display_point_impl(row, column, extend, soft_wrap_column, true)
+    }
+
+    pub fn select_display_point_transient(
+        &mut self,
+        row: usize,
+        column: usize,
+        extend: bool,
+        soft_wrap_column: Option<usize>,
+    ) -> Result<(), String> {
+        self.select_display_point_impl(row, column, extend, soft_wrap_column, false)
+    }
+
+    fn select_display_point_impl(
+        &mut self,
+        row: usize,
+        column: usize,
+        extend: bool,
+        soft_wrap_column: Option<usize>,
+        record_history: bool,
+    ) -> Result<(), String> {
         let display = self.display_snapshot(soft_wrap_column);
         let target = display.source_offset_for_display_point(DisplayPoint { row, column });
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
         let mut selection = self.active_selection()?;
         if extend {
             selection.set_head(target);
@@ -446,7 +592,14 @@ impl EditorModel {
             selection.collapse_to(target);
         }
         selection.goal = SelectionGoal::None;
-        self.set_active_selection(selection)
+        self.set_active_selection(selection)?;
+        if record_history {
+            self.push_selection_only_history_from_current(
+                undo_selections,
+                undo_active_selection_index,
+            );
+        }
+        Ok(())
     }
 
     pub fn select_word_at_display_point(
@@ -475,6 +628,34 @@ impl EditorModel {
         self.select(range);
     }
 
+    pub fn collapse_selections_to_heads(&mut self) {
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
+        let active_head = undo_selections
+            .get(self.active_selection_index)
+            .map(Selection::head);
+
+        let selections = undo_selections
+            .iter()
+            .map(|selection| {
+                let mut caret = Selection::caret(selection.head());
+                caret.id = selection.id;
+                caret
+            })
+            .collect();
+        let normalized = normalize_new_selections(selections);
+        let active_selection_index = active_head
+            .and_then(|head| {
+                normalized
+                    .iter()
+                    .position(|selection| selection.is_empty() && selection.head() == head)
+            })
+            .unwrap_or_else(|| undo_active_selection_index.min(normalized.len().saturating_sub(1)));
+
+        self.set_selections_with_active_index(normalized, active_selection_index);
+        self.push_selection_only_history_from_current(undo_selections, undo_active_selection_index);
+    }
+
     pub fn select_next_match(&mut self) -> bool {
         let text = self.snapshot().text().to_string();
         let mut selections = self.resolved_selections();
@@ -496,6 +677,8 @@ impl EditorModel {
             return false;
         }
 
+        let undo_selections = selections.clone();
+        let undo_active_selection_index = self.active_selection_index;
         let search_start = selections
             .iter()
             .map(|selection| selection.end)
@@ -520,11 +703,14 @@ impl EditorModel {
             })
             .unwrap_or_else(|| normalized.len().saturating_sub(1));
         self.set_selections_with_active_index(normalized, active_selection_index);
+        self.push_selection_only_history_from_current(undo_selections, undo_active_selection_index);
         true
     }
 
     pub fn select_all_matches(&mut self) -> bool {
         let text = self.snapshot().text().to_string();
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
         let Some(active_selection) = self
             .resolved_selections()
             .get(self.active_selection_index)
@@ -557,11 +743,14 @@ impl EditorModel {
             .position(|selection| selection.start == range.start && selection.end == range.end)
             .unwrap_or_else(|| selections.len().saturating_sub(1));
         self.set_selections_with_active_index(selections, active_selection_index);
+        self.push_selection_only_history_from_current(undo_selections, undo_active_selection_index);
         true
     }
 
     pub fn skip_active_match(&mut self) -> bool {
         let text = self.snapshot().text().to_string();
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
         let mut selections = self.resolved_selections();
         let Some(active_selection) = selections.get(self.active_selection_index).cloned() else {
             return false;
@@ -594,6 +783,10 @@ impl EditorModel {
                 })
                 .unwrap_or_else(|| normalized.len().saturating_sub(1));
             self.set_selections_with_active_index(normalized, active_selection_index);
+            self.push_selection_only_history_from_current(
+                undo_selections,
+                undo_active_selection_index,
+            );
             return true;
         }
 
@@ -607,6 +800,29 @@ impl EditorModel {
             .position(|selection| selection.start >= active_selection.end)
             .unwrap_or_else(|| selections.len().saturating_sub(1));
         self.set_selections_with_active_index(selections, active_selection_index);
+        self.push_selection_only_history_from_current(undo_selections, undo_active_selection_index);
+        true
+    }
+
+    pub fn undo_selection(&mut self) -> bool {
+        let Some(history_entry) = self.selection_only_undo_stack.pop() else {
+            return false;
+        };
+        let selections = history_entry.undo.clone();
+        let active_selection_index = history_entry.undo_active_selection_index;
+        self.set_selections_with_active_index(selections, active_selection_index);
+        self.selection_only_redo_stack.push(history_entry);
+        true
+    }
+
+    pub fn redo_selection(&mut self) -> bool {
+        let Some(history_entry) = self.selection_only_redo_stack.pop() else {
+            return false;
+        };
+        let selections = history_entry.redo.clone();
+        let active_selection_index = history_entry.redo_active_selection_index;
+        self.set_selections_with_active_index(selections, active_selection_index);
+        self.selection_only_undo_stack.push(history_entry);
         true
     }
 
@@ -621,6 +837,8 @@ impl EditorModel {
     }
 
     fn move_active_head(&mut self, target: usize, extend: bool) -> Result<(), String> {
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
         let mut selection = self.active_selection()?;
         if extend {
             selection.set_head(target);
@@ -628,6 +846,7 @@ impl EditorModel {
             selection.collapse_to(target);
         }
         self.set_active_selection(selection)?;
+        self.push_selection_only_history_from_current(undo_selections, undo_active_selection_index);
         Ok(())
     }
 
@@ -652,6 +871,8 @@ impl EditorModel {
             row_delta,
             desired_column,
         );
+        let undo_selections = self.resolved_selections();
+        let undo_active_selection_index = self.active_selection_index;
         let mut selection = selection;
         if extend {
             selection.set_head(target);
@@ -659,7 +880,9 @@ impl EditorModel {
             selection.collapse_to(target);
         }
         selection.goal = SelectionGoal::Column(desired_column);
-        self.set_active_selection(selection)
+        self.set_active_selection(selection)?;
+        self.push_selection_only_history_from_current(undo_selections, undo_active_selection_index);
+        Ok(())
     }
 
     pub fn insert_text(&mut self, text: impl Into<String>) -> Result<(), String> {
@@ -966,6 +1189,28 @@ impl EditorModel {
         });
         self.selection_redo_stack.clear();
     }
+
+    fn push_selection_only_history_from_current(
+        &mut self,
+        undo: Vec<Selection>,
+        undo_active_selection_index: usize,
+    ) {
+        let redo = self.resolved_selections();
+        let redo_active_selection_index = self.active_selection_index;
+        if selection_history_key(&undo, undo_active_selection_index)
+            == selection_history_key(&redo, redo_active_selection_index)
+        {
+            return;
+        }
+
+        self.selection_only_undo_stack.push(SelectionHistoryEntry {
+            undo,
+            undo_active_selection_index,
+            redo,
+            redo_active_selection_index,
+        });
+        self.selection_only_redo_stack.clear();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1015,6 +1260,25 @@ fn selections_overlap_or_duplicate(left: &Selection, right: &Selection) -> bool 
     }
 
     left.start < right.end && right.start < left.end
+}
+
+fn selection_history_key(
+    selections: &[Selection],
+    active_selection_index: usize,
+) -> Vec<(usize, usize, usize, bool)> {
+    let mut key = selections
+        .iter()
+        .map(|selection| {
+            (
+                selection.id,
+                selection.start,
+                selection.end,
+                selection.reversed,
+            )
+        })
+        .collect::<Vec<_>>();
+    key.push((usize::MAX, active_selection_index, 0, false));
+    key
 }
 
 #[derive(Clone, Debug)]
@@ -1840,6 +2104,230 @@ mod tests {
         );
         assert_eq!(editor.active_selection_index(), 0);
         assert_eq!(editor.selected_text(), "foo");
+    }
+
+    #[test]
+    fn selection_only_undo_redo_restore_match_selection_changes() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "foo bar foo");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(1..1);
+        assert!(editor.select_next_match());
+        assert!(editor.select_next_match());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 8..11]
+        );
+        assert_eq!(editor.active_selection_index(), 1);
+
+        assert!(editor.undo_selection());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+
+        assert!(editor.redo_selection());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 8..11]
+        );
+        assert_eq!(editor.active_selection_index(), 1);
+    }
+
+    #[test]
+    fn selection_only_undo_does_not_change_text() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "foo bar foo");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(1..1);
+        assert!(editor.select_next_match());
+        editor.insert_text("baz").unwrap();
+        assert_eq!(editor.snapshot().text(), "baz bar foo");
+
+        assert!(editor.undo_selection());
+        assert_eq!(editor.snapshot().text(), "baz bar foo");
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![1..1]
+        );
+    }
+
+    #[test]
+    fn selection_only_undo_restores_keyboard_movement_and_shift_selection() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.move_right(false).unwrap();
+        editor.move_right(true).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 1..2);
+        assert_eq!(editor.resolved_selections()[0].head(), 2);
+
+        assert!(editor.undo_selection());
+        assert_eq!(editor.resolved_selections()[0].range(), 1..1);
+        assert_eq!(editor.resolved_selections()[0].head(), 1);
+
+        assert!(editor.redo_selection());
+        assert_eq!(editor.resolved_selections()[0].range(), 1..2);
+        assert_eq!(editor.resolved_selections()[0].head(), 2);
+    }
+
+    #[test]
+    fn selection_only_undo_restores_display_point_selection_changes() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\ndef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_display_point(1, 2, false, None).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 6..6);
+
+        assert!(editor.undo_selection());
+        assert_eq!(editor.resolved_selections()[0].range(), 0..0);
+
+        assert!(editor.redo_selection());
+        assert_eq!(editor.resolved_selections()[0].range(), 6..6);
+    }
+
+    #[test]
+    fn selection_only_undo_groups_multi_row_display_movement() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.move_display_rows(2, false, None).unwrap();
+        assert_eq!(editor.cursor_offset().unwrap(), 4);
+
+        assert!(editor.undo_selection());
+        assert_eq!(editor.cursor_offset().unwrap(), 0);
+        assert!(!editor.undo_selection());
+
+        assert!(editor.redo_selection());
+        assert_eq!(editor.cursor_offset().unwrap(), 4);
+    }
+
+    #[test]
+    fn selection_only_checkpoint_groups_transient_display_point_changes() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\ndef");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        let checkpoint = editor.selection_history_checkpoint();
+        editor
+            .select_display_point_transient(0, 1, false, None)
+            .unwrap();
+        editor
+            .select_display_point_transient(1, 2, true, None)
+            .unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 1..6);
+
+        editor.commit_selection_only_history_from_checkpoint(checkpoint);
+        assert!(editor.undo_selection());
+        assert_eq!(editor.resolved_selections()[0].range(), 0..0);
+        assert!(!editor.undo_selection());
+
+        assert!(editor.redo_selection());
+        assert_eq!(editor.resolved_selections()[0].range(), 1..6);
+    }
+
+    #[test]
+    fn selection_only_undo_redo_preserves_active_index_for_collapsed_selections() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcdefghi");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select_anchor_heads(vec![(0, 3), (8, 5)]);
+        editor.set_active_selection_index(0).unwrap();
+        editor.collapse_selections_to_heads();
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![3..3, 5..5]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+
+        assert!(editor.undo_selection());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 5..8]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+
+        assert!(editor.redo_selection());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![3..3, 5..5]
+        );
+        assert_eq!(editor.active_selection_index(), 0);
+    }
+
+    #[test]
+    fn selection_only_undo_restores_multi_caret_and_rectangle_changes() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd\nef\nghij");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(6..6);
+        editor.add_caret_at_display_point(2, 1, None);
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![6..6, 9..9]
+        );
+
+        assert!(editor.undo_selection());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![6..6]
+        );
+
+        editor.select_display_rectangle(0, 1, 2, 3, None);
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![1..3, 6..7, 9..11]
+        );
+
+        assert!(editor.undo_selection());
+        assert_eq!(
+            editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![6..6]
+        );
     }
 
     #[test]

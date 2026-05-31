@@ -1,4 +1,4 @@
-use editor::{EditorModel, Selection};
+use editor::{EditorModel, Selection, SelectionHistoryCheckpoint};
 use std::{ops::Range, time::Duration};
 
 use gpui::{
@@ -30,6 +30,7 @@ pub struct EditorView {
     focus_handle: Option<FocusHandle>,
     marked_range: Option<Range<usize>>,
     selecting_with_mouse: bool,
+    mouse_selection_checkpoint: Option<SelectionHistoryCheckpoint>,
     rectangular_selection_start: Option<(usize, usize)>,
     drag_autoscroll: Option<DragAutoscroll>,
     drag_autoscroll_generation: u64,
@@ -39,6 +40,7 @@ pub struct EditorView {
     hovered_scrollbar_row: Option<usize>,
     viewport_start_row: usize,
     viewport_rows: usize,
+    linewise_clipboard_text: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,6 +74,8 @@ pub enum EditorCommand {
     Delete,
     Undo,
     Redo,
+    UndoSelection,
+    RedoSelection,
     MoveLeft { extend: bool },
     MoveRight { extend: bool },
     MoveUp { extend: bool },
@@ -375,6 +379,7 @@ impl EditorView {
             focus_handle: None,
             marked_range: None,
             selecting_with_mouse: false,
+            mouse_selection_checkpoint: None,
             rectangular_selection_start: None,
             drag_autoscroll: None,
             drag_autoscroll_generation: 0,
@@ -384,6 +389,7 @@ impl EditorView {
             hovered_scrollbar_row: None,
             viewport_start_row: 0,
             viewport_rows: DEFAULT_VIEWPORT_ROWS,
+            linewise_clipboard_text: None,
         }
     }
 
@@ -393,6 +399,7 @@ impl EditorView {
             focus_handle: Some(focus_handle),
             marked_range: None,
             selecting_with_mouse: false,
+            mouse_selection_checkpoint: None,
             rectangular_selection_start: None,
             drag_autoscroll: None,
             drag_autoscroll_generation: 0,
@@ -402,6 +409,7 @@ impl EditorView {
             hovered_scrollbar_row: None,
             viewport_start_row: 0,
             viewport_rows: DEFAULT_VIEWPORT_ROWS,
+            linewise_clipboard_text: None,
         }
     }
 
@@ -429,6 +437,12 @@ impl EditorView {
             }
             EditorCommand::Redo => {
                 self.editor.redo()?;
+            }
+            EditorCommand::UndoSelection => {
+                self.editor.undo_selection();
+            }
+            EditorCommand::RedoSelection => {
+                self.editor.redo_selection();
             }
             EditorCommand::MoveLeft { extend } => self.editor.move_left(extend)?,
             EditorCommand::MoveRight { extend } => self.editor.move_right(extend)?,
@@ -569,6 +583,7 @@ impl EditorView {
         if let Some(hit) = self.scrollbar_hit_for_position(event.position) {
             self.hovered_scrollbar_row = Some(hit.visible_row);
             self.selecting_with_mouse = false;
+            self.mouse_selection_checkpoint = None;
             self.rectangular_selection_start = None;
             self.drag_autoscroll = None;
             if hit.thumb_rows.contains(&hit.visible_row) {
@@ -595,6 +610,7 @@ impl EditorView {
         let (row, column) = self.display_point_for_mouse_position(event.position);
         let result = match event.click_count {
             3.. => {
+                self.commit_mouse_selection_history();
                 self.selecting_with_mouse = false;
                 self.rectangular_selection_start = None;
                 self.drag_autoscroll = None;
@@ -608,6 +624,7 @@ impl EditorView {
                 Ok(())
             }
             2 => {
+                self.commit_mouse_selection_history();
                 self.selecting_with_mouse = false;
                 self.rectangular_selection_start = None;
                 self.drag_autoscroll = None;
@@ -626,8 +643,10 @@ impl EditorView {
                 self.scrollbar_track_press = None;
                 if event.modifiers.alt && !event.modifiers.shift {
                     self.selecting_with_mouse = true;
+                    self.mouse_selection_checkpoint =
+                        Some(self.editor.selection_history_checkpoint());
                     self.rectangular_selection_start = Some((row, column));
-                    self.editor.add_caret_at_display_point(
+                    self.editor.add_caret_at_display_point_transient(
                         row,
                         column,
                         Some(DEFAULT_SOFT_WRAP_COLUMN),
@@ -635,8 +654,10 @@ impl EditorView {
                     Ok(())
                 } else {
                     self.selecting_with_mouse = true;
+                    self.mouse_selection_checkpoint =
+                        Some(self.editor.selection_history_checkpoint());
                     self.rectangular_selection_start = None;
-                    self.editor.select_display_point(
+                    self.editor.select_display_point_transient(
                         row,
                         column,
                         event.modifiers.shift,
@@ -731,6 +752,7 @@ impl EditorView {
             || self.scrollbar_track_press.is_some()
         {
             self.selecting_with_mouse = false;
+            self.commit_mouse_selection_history();
             self.rectangular_selection_start = None;
             self.drag_autoscroll = None;
             self.scrollbar_drag = None;
@@ -765,42 +787,27 @@ impl EditorView {
     fn cancel_interaction(&mut self) {
         self.marked_range = None;
         self.selecting_with_mouse = false;
+        self.mouse_selection_checkpoint = None;
         self.rectangular_selection_start = None;
         self.drag_autoscroll = None;
         self.scrollbar_drag = None;
         self.scrollbar_track_press = None;
 
-        let selections = self.editor.resolved_selections();
-        if selections.is_empty() {
-            return;
-        }
+        self.editor.collapse_selections_to_heads();
+    }
 
-        let active_selection_index = self.editor.active_selection_index();
-        self.editor.select_anchor_heads(
-            selections
-                .iter()
-                .map(|selection| {
-                    let head = selection.head();
-                    (head, head)
-                })
-                .collect(),
-        );
-        let _ = self
-            .editor
-            .set_active_selection_index(active_selection_index);
+    fn commit_mouse_selection_history(&mut self) {
+        if let Some(checkpoint) = self.mouse_selection_checkpoint.take() {
+            self.editor
+                .commit_selection_only_history_from_checkpoint(checkpoint);
+        }
     }
 
     fn move_page(&mut self, direction: isize, extend: bool) -> Result<(), String> {
-        let page_rows = self.viewport_rows.max(1);
-        for _ in 0..page_rows {
-            if direction < 0 {
-                self.editor
-                    .move_up(extend, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
-            } else {
-                self.editor
-                    .move_down(extend, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
-            }
-        }
+        let page_rows = isize::try_from(self.viewport_rows.max(1)).unwrap_or(isize::MAX);
+        let row_delta = if direction < 0 { -page_rows } else { page_rows };
+        self.editor
+            .move_display_rows(row_delta, extend, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
         self.scroll_viewport(direction);
         Ok(())
     }
@@ -1094,8 +1101,12 @@ impl EditorView {
         position: Point<Pixels>,
     ) -> Result<(), String> {
         let (row, column) = self.display_point_for_drag_position(position);
-        self.editor
-            .select_display_point(row, column, true, Some(DEFAULT_SOFT_WRAP_COLUMN))?;
+        self.editor.select_display_point_transient(
+            row,
+            column,
+            true,
+            Some(DEFAULT_SOFT_WRAP_COLUMN),
+        )?;
         self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
         Ok(())
     }
@@ -1108,7 +1119,7 @@ impl EditorView {
             return Ok(());
         };
         let (head_row, head_column) = self.display_point_for_drag_position(position);
-        self.editor.select_display_rectangle(
+        self.editor.select_display_rectangle_transient(
             anchor_row,
             anchor_column,
             head_row,
@@ -1152,7 +1163,9 @@ impl EditorView {
         let before_text = self.editor.snapshot().text().to_string();
         let before_selections = selection_state(&self.editor);
         let selections = self.editor.resolved_selections();
-        let replacements = if is_linewise_paste(text, &selections) {
+        let is_linewise_paste =
+            is_linewise_paste(text, &selections, self.linewise_clipboard_text.as_deref());
+        let replacements = if is_linewise_paste {
             let insert_ranges = line_start_ranges_for_offsets(
                 &before_text,
                 selections.iter().map(|selection| selection.head()),
@@ -1168,6 +1181,7 @@ impl EditorView {
         } else {
             self.editor.insert_text(text.to_string())?;
         }
+        self.linewise_clipboard_text = None;
 
         let after_text = self.editor.snapshot().text().to_string();
         let after_selections = selection_state(&self.editor);
@@ -1188,6 +1202,7 @@ impl EditorView {
         }
 
         cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+        self.linewise_clipboard_text = None;
 
         if delete_after_copy {
             self.dispatch_command(EditorCommand::Delete)
@@ -1212,6 +1227,7 @@ impl EditorView {
                 .iter()
                 .map(|selection| selection.head()),
         );
+        self.linewise_clipboard_text = Some(clipboard_text.clone());
         cx.write_to_clipboard(ClipboardItem::new_string(clipboard_text));
 
         if delete_after_copy {
@@ -1377,8 +1393,14 @@ fn current_line_clipboard_text_and_delete_ranges(
     (clipboard_text, delete_ranges)
 }
 
-fn is_linewise_paste(text: &str, selections: &[Selection]) -> bool {
-    text.ends_with('\n') && selections.iter().all(|selection| selection.is_empty())
+fn is_linewise_paste(
+    text: &str,
+    selections: &[Selection],
+    linewise_clipboard_text: Option<&str>,
+) -> bool {
+    linewise_clipboard_text == Some(text)
+        && text.ends_with('\n')
+        && selections.iter().all(|selection| selection.is_empty())
 }
 
 fn distributed_paste_replacements(
@@ -1670,6 +1692,8 @@ fn command_for_keystroke(keystroke: &Keystroke) -> Option<EditorCommand> {
         "z" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Undo),
         "z" if shortcut_modifiers(modifiers, true) => Some(EditorCommand::Redo),
         "y" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::Redo),
+        "u" if shortcut_modifiers(modifiers, false) => Some(EditorCommand::UndoSelection),
+        "u" if shortcut_modifiers(modifiers, true) => Some(EditorCommand::RedoSelection),
         _ => None,
     }
 }
@@ -2750,6 +2774,26 @@ mod tests {
     }
 
     #[test]
+    fn view_groups_page_navigation_as_one_selection_history_entry() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3\n4\n5").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(2);
+
+        view.dispatch_command(EditorCommand::PageDown { extend: false })
+            .unwrap();
+        assert_eq!(view.editor.cursor_display_point(None).unwrap().row, 2);
+
+        view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+        assert_eq!(view.editor.cursor_display_point(None).unwrap().row, 0);
+        assert!(!view.editor.undo_selection());
+
+        view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+        assert_eq!(view.editor.cursor_display_point(None).unwrap().row, 2);
+    }
+
+    #[test]
     fn drag_beyond_viewport_autoscrolls_and_extends_selection() {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -2885,6 +2929,28 @@ mod tests {
             view.rendered_lines(None)[0].text_with_overlays(),
             "abc|de|fghi"
         );
+
+        view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+        assert_eq!(view.editor.active_selection_index(), 1);
+        assert_eq!(
+            view.editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![0..3, 5..8]
+        );
+
+        view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+        assert_eq!(view.editor.active_selection_index(), 1);
+        assert_eq!(
+            view.editor
+                .resolved_selections()
+                .iter()
+                .map(Selection::range)
+                .collect::<Vec<_>>(),
+            vec![3..3, 5..5]
+        );
     }
 
     #[test]
@@ -3004,6 +3070,14 @@ mod tests {
         assert_eq!(
             command_for_keystroke(&Keystroke::parse("secondary-y").unwrap()),
             Some(EditorCommand::Redo)
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-u").unwrap()),
+            Some(EditorCommand::UndoSelection)
+        );
+        assert_eq!(
+            command_for_keystroke(&Keystroke::parse("secondary-shift-u").unwrap()),
+            Some(EditorCommand::RedoSelection)
         );
     }
 
@@ -3469,6 +3543,111 @@ mod tests {
                 view.rendered_lines(None)[0].text_with_overlays(),
                 "[foo]| foo [foo]|"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_undo_redo_selection_restores_match_selection(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "foo bar foo").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("right secondary-d secondary-d secondary-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.editor.active_selection_index(), 0);
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "[foo]| bar foo"
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-shift-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.editor.active_selection_index(), 1);
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "[foo]| bar [foo]|"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_undo_redo_selection_restores_navigation_selection(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("right shift-right secondary-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a|bc");
+        });
+
+        cx.simulate_keystrokes("secondary-shift-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[b]|c");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_undo_redo_selection_restores_mouse_click(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\ndef").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            Modifiers::default(),
+        );
+        cx.simulate_keystrokes("secondary-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+        });
+
+        cx.simulate_keystrokes("secondary-shift-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "de|f");
         });
     }
 
@@ -3998,6 +4177,39 @@ mod tests {
     fn gpui_linewise_clipboard_paste_inserts_before_current_line(cx: &mut gpui::TestAppContext) {
         let editor = EditorModel::for_buffer(
             "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "alpha\none\ntwo\nthree").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        view.update(cx, |view, _| view.editor.select(1..1));
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alpha\n".to_string())
+        );
+
+        view.update(cx, |view, _| view.editor.select(15..15));
+        cx.simulate_keystrokes("secondary-v");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\none\ntwo\nalpha\nthree");
+            assert_eq!(view.rendered_lines(None)[4].text_with_overlays(), "|three");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_external_trailing_newline_pastes_as_regular_text(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
             Buffer::local(BufferId::new(1).unwrap(), "one\ntwo\nthree").into_handle(),
         );
         let (view, cx) = cx.add_window_view(|window, cx| {
@@ -4016,8 +4228,8 @@ mod tests {
         cx.simulate_keystrokes("secondary-v");
 
         view.update(cx, |view, _| {
-            assert_eq!(view.text(), "one\ntwo\nalpha\nthree");
-            assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "|three");
+            assert_eq!(view.text(), "one\ntwo\nthalpha\nree");
+            assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "|ree");
         });
     }
 
@@ -4060,9 +4272,9 @@ mod tests {
     ) {
         let mut editor = EditorModel::for_buffer(
             "scratch",
-            Buffer::local(BufferId::new(1).unwrap(), "one\ntwo\nthree").into_handle(),
+            Buffer::local(BufferId::new(1).unwrap(), "alpha\nbeta\none\ntwo\nthree").into_handle(),
         );
-        editor.select_ranges(vec![5..5, 10..10]);
+        editor.select_ranges(vec![1..1, 7..7]);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let focus_handle = cx.focus_handle();
             window.focus(&focus_handle);
@@ -4074,17 +4286,27 @@ mod tests {
             window.focus(&focus_handle);
             window.activate_window();
         });
-        cx.write_to_clipboard(ClipboardItem::new_string("alpha\nbeta\n".to_string()));
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alpha\nbeta\n".to_string())
+        );
+
+        view.update(cx, |view, _| {
+            view.editor.select_ranges(vec![16..16, 20..20])
+        });
         cx.simulate_keystrokes("secondary-v");
 
         view.update(cx, |view, _| {
-            assert_eq!(view.text(), "one\nalpha\ntwo\nbeta\nthree");
+            assert_eq!(view.text(), "alpha\nbeta\none\nalpha\ntwo\nbeta\nthree");
             assert_eq!(
                 view.rendered_lines(None)
                     .into_iter()
                     .map(|line| line.text_with_overlays())
                     .collect::<Vec<_>>(),
                 vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
                     "one".to_string(),
                     "alpha".to_string(),
                     "|two".to_string(),
@@ -4136,6 +4358,23 @@ mod tests {
             },
         );
         view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[|bc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[de]f");
+        });
+
+        view.update(cx, |view, _| {
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "abc");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "de|f");
+
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "de|f");
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
             assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[|bc]");
             assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[de]f");
         });
@@ -4245,6 +4484,22 @@ mod tests {
                 ]
             );
         });
+
+        view.update(cx, |view, _| {
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.editor.selected_text(), "");
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![1..3, 6..7, 9..11]
+            );
+        });
     }
 
     #[gpui::test]
@@ -4291,6 +4546,17 @@ mod tests {
 
         view.update(cx, |view, _| {
             assert!(!view.selecting_with_mouse);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[bc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[de]|f");
+        });
+
+        view.update(cx, |view, _| {
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+            assert_eq!(view.editor.selected_text(), "");
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
             assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[bc]");
             assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[de]|f");
         });
@@ -4373,6 +4639,16 @@ mod tests {
             assert_eq!(view.viewport_start_row(), 2);
             assert_eq!(view.editor.selected_text(), "0\n1\n2\n");
         });
+
+        view.update(cx, |view, _| {
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.editor.selected_text(), "");
+            assert_eq!(view.editor.cursor_offset().unwrap(), 0);
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(view.editor.selected_text(), "0\n1\n2\n");
+        });
     }
 
     #[gpui::test]
@@ -4435,6 +4711,44 @@ mod tests {
             first_mouse: false,
         });
         view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)[1].text_with_overlays(),
+                "[three four]|"
+            );
+        });
+
+        view.update(cx, |view, _| {
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "one [two]|"
+            );
+
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "one t|wo"
+            );
+
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "|one two"
+            );
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "one t|wo"
+            );
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "one [two]|"
+            );
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
             assert_eq!(
                 view.rendered_lines(None)[1].text_with_overlays(),
                 "[three four]|"
