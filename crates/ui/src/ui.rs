@@ -2710,6 +2710,54 @@ mod tests {
     }
 
     #[test]
+    fn view_enter_resets_vertical_movement_column_goal() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(2).unwrap(), "abcd\nef\nghij").into_handle(),
+        );
+        let mut view = EditorView::new(editor);
+        view.editor.select(3..3);
+        view.dispatch_command(EditorCommand::MoveDown { extend: false })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "ef|");
+        view.dispatch_command(EditorCommand::InsertText("\n"))
+            .unwrap();
+        assert_eq!(
+            view.rendered_lines(None)
+                .into_iter()
+                .map(|line| line.text_with_overlays())
+                .collect::<Vec<_>>(),
+            vec![
+                "abcd".to_string(),
+                "ef".to_string(),
+                "|".to_string(),
+                "ghij".to_string()
+            ]
+        );
+        view.dispatch_command(EditorCommand::MoveDown { extend: false })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "|ghij");
+    }
+
+    #[test]
+    fn view_vertical_movement_preserves_column_goal_through_empty_lines() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let mut view = EditorView::new(editor);
+        view.editor.select(3..3);
+
+        view.dispatch_command(EditorCommand::MoveDown { extend: false })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+
+        view.dispatch_command(EditorCommand::MoveDown { extend: false })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "wxy|z");
+    }
+
+    #[test]
     fn view_renders_only_visible_viewport_rows() {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -4122,8 +4170,38 @@ mod tests {
             assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "| world");
         });
 
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "hello world");
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "[hello]| world"
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-y");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), " world");
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "| world");
+        });
+
         cx.write_to_clipboard(ClipboardItem::new_string("zed\neditor".to_string()));
         cx.simulate_keystrokes("secondary-v");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "zed\neditor world");
+            assert_eq!(
+                view.rendered_lines(None)[1].text_with_overlays(),
+                "editor| world"
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), " world");
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "| world");
+        });
+
+        cx.simulate_keystrokes("secondary-y");
         view.update(cx, |view, _| {
             assert_eq!(view.text(), "zed\neditor world");
             assert_eq!(
@@ -4171,6 +4249,18 @@ mod tests {
             assert_eq!(view.text(), "one\nthree");
             assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|three");
         });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "one\ntwo\nthree");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[two]");
+        });
+
+        cx.simulate_keystrokes("secondary-y");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "one\nthree");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|three");
+        });
     }
 
     #[gpui::test]
@@ -4200,6 +4290,18 @@ mod tests {
         view.update(cx, |view, _| view.editor.select(15..15));
         cx.simulate_keystrokes("secondary-v");
 
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\none\ntwo\nalpha\nthree");
+            assert_eq!(view.rendered_lines(None)[4].text_with_overlays(), "|three");
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\none\ntwo\nthree");
+            assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "|three");
+        });
+
+        cx.simulate_keystrokes("secondary-y");
         view.update(cx, |view, _| {
             assert_eq!(view.text(), "alpha\none\ntwo\nalpha\nthree");
             assert_eq!(view.rendered_lines(None)[4].text_with_overlays(), "|three");
@@ -4234,6 +4336,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn gpui_linewise_clipboard_intent_is_consumed_after_paste(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "alpha\none\ntwo\nthree").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        view.update(cx, |view, _| view.editor.select(1..1));
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alpha\n".to_string())
+        );
+
+        view.update(cx, |view, _| view.editor.select(15..15));
+        cx.simulate_keystrokes("secondary-v");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\none\ntwo\nalpha\nthree");
+            assert_eq!(view.rendered_lines(None)[4].text_with_overlays(), "|three");
+        });
+
+        view.update(cx, |view, _| {
+            let three_start = view.text().find("three").expect("three line");
+            view.editor.select(three_start + 2..three_start + 2);
+        });
+        cx.simulate_keystrokes("secondary-v");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\none\ntwo\nalpha\nthalpha\nree");
+            assert_eq!(view.rendered_lines(None)[5].text_with_overlays(), "|ree");
+        });
+    }
+
+    #[gpui::test]
     fn gpui_multi_cursor_paste_distributes_clipboard_lines(cx: &mut gpui::TestAppContext) {
         let mut editor = EditorModel::for_buffer(
             "scratch",
@@ -4254,6 +4399,30 @@ mod tests {
         cx.write_to_clipboard(ClipboardItem::new_string("alpha\nbeta".to_string()));
         cx.simulate_keystrokes("secondary-v");
 
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alphaone\nbetatwo");
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["alpha|one".to_string(), "beta|two".to_string()]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "one\ntwo");
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["|one".to_string(), "|two".to_string()]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-y");
         view.update(cx, |view, _| {
             assert_eq!(view.text(), "alphaone\nbetatwo");
             assert_eq!(
@@ -4297,6 +4466,44 @@ mod tests {
         });
         cx.simulate_keystrokes("secondary-v");
 
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\nbeta\none\nalpha\ntwo\nbeta\nthree");
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
+                    "one".to_string(),
+                    "alpha".to_string(),
+                    "|two".to_string(),
+                    "beta".to_string(),
+                    "|three".to_string(),
+                ]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\nbeta\none\ntwo\nthree");
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
+                    "one".to_string(),
+                    "|two".to_string(),
+                    "|three".to_string(),
+                ]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-y");
         view.update(cx, |view, _| {
             assert_eq!(view.text(), "alpha\nbeta\none\nalpha\ntwo\nbeta\nthree");
             assert_eq!(

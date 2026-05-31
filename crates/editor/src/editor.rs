@@ -1856,6 +1856,35 @@ mod tests {
     }
 
     #[test]
+    fn vertical_movement_preserves_column_goal_through_empty_lines() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(3..3);
+        editor.move_down(false, None).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 5..5);
+
+        editor.move_down(false, None).unwrap();
+        assert_eq!(editor.resolved_selections()[0].range(), 9..9);
+    }
+
+    #[test]
+    fn insert_text_clears_vertical_column_goal() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "abcd\nef\nghij");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+
+        editor.select(3..3);
+        editor.move_down(false, None).unwrap();
+        assert_eq!(editor.cursor_offset().unwrap(), 7);
+
+        editor.insert_text("\n").unwrap();
+        assert_eq!(editor.cursor_offset().unwrap(), 8);
+
+        editor.move_down(false, None).unwrap();
+        assert_eq!(editor.cursor_offset().unwrap(), 9);
+    }
+
+    #[test]
     fn vertical_movement_extends_selection() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "abc\ndef");
         let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
