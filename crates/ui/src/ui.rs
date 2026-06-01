@@ -21,6 +21,7 @@ const CARET_WIDTH: Pixels = px(2.0);
 const SCROLLBAR_WIDTH: Pixels = px(6.0);
 const SCROLLBAR_GAP: Pixels = px(8.0);
 const DEFAULT_VIEWPORT_ROWS: usize = 20;
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const SCROLLBAR_TRACK_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(350);
 const SCROLLBAR_TRACK_REPEAT_INTERVAL: Duration = Duration::from_millis(75);
 const DRAG_AUTOSCROLL_REPEAT_INTERVAL: Duration = Duration::from_millis(75);
@@ -42,6 +43,8 @@ pub struct EditorView {
     viewport_start_row: usize,
     viewport_rows: usize,
     linewise_clipboard_text: Option<String>,
+    cursor_blink_visible: bool,
+    cursor_blink_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -463,6 +466,8 @@ impl EditorView {
             viewport_start_row: 0,
             viewport_rows: DEFAULT_VIEWPORT_ROWS,
             linewise_clipboard_text: None,
+            cursor_blink_visible: true,
+            cursor_blink_generation: 0,
         }
     }
 
@@ -483,6 +488,8 @@ impl EditorView {
             viewport_start_row: 0,
             viewport_rows: DEFAULT_VIEWPORT_ROWS,
             linewise_clipboard_text: None,
+            cursor_blink_visible: true,
+            cursor_blink_generation: 0,
         }
     }
 
@@ -635,6 +642,7 @@ impl EditorView {
         if let Some(command) = command_for_keystroke(&event.keystroke) {
             match self.dispatch_context_command(command, cx) {
                 Ok(_) => {
+                    self.restart_cursor_blink(cx);
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -743,6 +751,7 @@ impl EditorView {
         match result {
             Ok(()) => {
                 self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
+                self.restart_cursor_blink(cx);
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -787,6 +796,7 @@ impl EditorView {
         match result {
             Ok(_) => {
                 self.update_drag_autoscroll(event.position, cx);
+                self.restart_cursor_blink(cx);
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -854,6 +864,41 @@ impl EditorView {
                 self.dispatch_paste_text(&text)
             }
             command => self.dispatch_command(command),
+        }
+    }
+
+    fn restart_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        self.cursor_blink_visible = true;
+        self.cursor_blink_generation = self.cursor_blink_generation.wrapping_add(1);
+        let generation = self.cursor_blink_generation;
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CURSOR_BLINK_INTERVAL).await;
+
+                let should_continue = this
+                    .update(cx, |view, cx| {
+                        if view.cursor_blink_generation != generation {
+                            return false;
+                        }
+
+                        view.cursor_blink_visible = !view.cursor_blink_visible;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn ensure_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        if self.cursor_blink_generation == 0 {
+            self.restart_cursor_blink(cx);
         }
     }
 
@@ -1921,7 +1966,10 @@ impl gpui::EntityInputHandler for EditorView {
         cx: &mut Context<Self>,
     ) {
         match self.replace_input_text(range_utf16, new_text) {
-            Ok(()) => cx.notify(),
+            Ok(()) => {
+                self.restart_cursor_blink(cx);
+                cx.notify();
+            }
             Err(error) => eprintln!("mini_ui input replacement failed: {error}"),
         }
     }
@@ -1935,7 +1983,10 @@ impl gpui::EntityInputHandler for EditorView {
         cx: &mut Context<Self>,
     ) {
         match self.replace_and_mark_input_text(range_utf16, new_text, new_selected_range_utf16) {
-            Ok(()) => cx.notify(),
+            Ok(()) => {
+                self.restart_cursor_blink(cx);
+                cx.notify();
+            }
             Err(error) => eprintln!("mini_ui marked input replacement failed: {error}"),
         }
     }
@@ -1964,6 +2015,7 @@ impl gpui::EntityInputHandler for EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_cursor_blink(cx);
         let rendered = self.rendered_editor(Some(100));
         let focus_handle = self.render_focus_handle(cx);
         let header_text = rendered.header_text();
@@ -1971,6 +2023,7 @@ impl Render for EditorView {
         let is_dirty = rendered.is_dirty;
         let lines = rendered.lines;
         let scrollbar = rendered.scrollbar;
+        let cursor_blink_visible = self.cursor_blink_visible;
         div()
             .size_full()
             .p_4()
@@ -2005,7 +2058,13 @@ impl Render for EditorView {
                     .flex()
                     .items_start()
                     .gap(SCROLLBAR_GAP)
-                    .child(div().children(lines.into_iter().map(render_editor_row)))
+                    .child(
+                        div().children(
+                            lines
+                                .into_iter()
+                                .map(move |line| render_editor_row(line, cursor_blink_visible)),
+                        ),
+                    )
                     .when_some(scrollbar, |this, scrollbar| {
                         this.child(render_scrollbar(scrollbar))
                     }),
@@ -2013,7 +2072,7 @@ impl Render for EditorView {
     }
 }
 
-fn render_editor_row(line: RenderedLine) -> impl IntoElement {
+fn render_editor_row(line: RenderedLine, active_cursor_visible: bool) -> impl IntoElement {
     div()
         .flex()
         .gap_3()
@@ -2032,12 +2091,14 @@ fn render_editor_row(line: RenderedLine) -> impl IntoElement {
                     line.line_number.to_string()
                 }),
         )
-        .child(render_visual_line(line))
+        .child(render_visual_line(line, active_cursor_visible))
 }
 
-fn render_visual_line(line: RenderedLine) -> impl IntoElement {
+fn render_visual_line(line: RenderedLine, active_cursor_visible: bool) -> impl IntoElement {
     canvas(
-        move |bounds, window, _cx| prepaint_visual_line(line, bounds, window),
+        move |bounds, window, _cx| {
+            prepaint_visual_line(line, bounds, window, active_cursor_visible)
+        },
         move |bounds, state, window, cx| {
             let VisualLinePaintState {
                 line,
@@ -2064,6 +2125,7 @@ fn prepaint_visual_line(
     rendered_line: RenderedLine,
     bounds: Bounds<Pixels>,
     window: &mut Window,
+    active_cursor_visible: bool,
 ) -> VisualLinePaintState {
     let line = shape_visual_line(&rendered_line.text, window);
     let mut background_quads = Vec::new();
@@ -2090,6 +2152,9 @@ fn prepaint_visual_line(
                 ));
             }
             RenderedLineOverlayKind::Cursor { active } => {
+                if active && !active_cursor_visible {
+                    continue;
+                }
                 cursor_quads.push(pixel_overlay_quad(
                     &rendered_line.text,
                     &line,
@@ -2751,6 +2816,7 @@ mod tests {
                 },
                 bounds,
                 window,
+                true,
             );
 
             assert_eq!(state.cursor_quads.len(), 1);
@@ -2762,6 +2828,73 @@ mod tests {
                 line_x_for_display_column("a😀c", &state.line, 1)
             );
             assert!(expected_caret_x > DISPLAY_COLUMN_WIDTH * 2);
+        });
+    }
+
+    #[gpui::test]
+    fn cursor_blink_timer_toggles_active_cursor_visibility(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        view.update(cx, |view, cx| {
+            view.restart_cursor_blink(cx);
+            assert!(view.cursor_blink_visible);
+        });
+
+        cx.executor().advance_clock(CURSOR_BLINK_INTERVAL);
+        cx.run_until_parked();
+
+        view.update(cx, |view, _cx| {
+            assert!(!view.cursor_blink_visible);
+        });
+
+        view.update(cx, |view, cx| {
+            view.restart_cursor_blink(cx);
+            assert!(view.cursor_blink_visible);
+        });
+    }
+
+    #[gpui::test]
+    fn hidden_active_cursor_leaves_secondary_cursors_visible(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc").into_handle(),
+        );
+        let (_view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, _cx| {
+            let bounds = Bounds::new(Point::default(), size(editor_text_width(), LINE_HEIGHT));
+            let state = prepaint_visual_line(
+                RenderedLine {
+                    line_number: 1,
+                    text: "abc".to_string(),
+                    continuation: false,
+                    cursor_columns: vec![1, 2],
+                    active_cursor_columns: vec![1],
+                    selection_ranges: Vec::new(),
+                    marked_ranges: Vec::new(),
+                },
+                bounds,
+                window,
+                false,
+            );
+
+            assert_eq!(state.cursor_quads.len(), 1);
+            assert_eq!(
+                state.cursor_quads[0].bounds.left(),
+                line_x_for_display_column("abc", &state.line, 2)
+            );
         });
     }
 
