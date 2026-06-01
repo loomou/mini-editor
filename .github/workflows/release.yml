@@ -24,9 +24,19 @@ env:
   APP_CRATE: app
 
 jobs:
+  approval:
+    name: Wait for release approval
+    runs-on: ubuntu-latest
+    environment: release
+
+    steps:
+      - name: Approved
+        run: echo "Release approved."
+
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
+    needs: approval
 
     strategy:
       fail-fast: false
