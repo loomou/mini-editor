@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: mini-editor
+  APP_CRATE: app
+
+jobs:
+  approval:
+    name: Wait for release approval
+    runs-on: ubuntu-latest
+    environment: release-approval
+
+    steps:
+      - name: Approved
+        run: echo "Release approved."
+
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    needs: approval
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+            binary_path: target/release/app.exe
+            binary_name: mini-editor.exe
+            archive: zip
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            binary_path: target/release/app
+            binary_name: mini-editor
+            archive: tar.gz
+          - os: macos-14
+            platform: macos-aarch64
+            binary_path: target/release/app
+            binary_name: mini-editor
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            libssl-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libxcursor-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-cursor-dev \
+            libxcb-icccm4-dev \
+            libxcb-image0-dev \
+            libxcb-keysyms1-dev \
+            libxcb-randr0-dev \
+            libxcb-render0-dev \
+            libxcb-render-util0-dev \
+            libxcb-shape0-dev \
+            libxcb-util-dev \
+            libxcb-xfixes0-dev \
+            libxcb-xkb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Read workspace version
+        id: version
+        shell: pwsh
+        run: |
+          $match = Get-Content Cargo.toml | Select-String -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match) {
+            throw "Could not find workspace version in Cargo.toml"
+          }
+          "version=$($match.Matches[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Build release binary
+        run: cargo build -p ${{ env.APP_CRATE }} --release --locked
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          $dist = "dist"
+          $version = "${{ steps.version.outputs.version }}"
+          $assetName = "$env:APP_NAME-v$version-${{ matrix.platform }}"
+          $assetDir = Join-Path $dist $assetName
+          New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
+
+          Copy-Item -Path "${{ matrix.binary_path }}" -Destination (Join-Path $assetDir "${{ matrix.binary_name }}")
+          Copy-Item -Path "README.md" -Destination $assetDir
+          if (Test-Path "LICENSE") {
+            Copy-Item -Path "LICENSE" -Destination $assetDir
+          }
+
+          if ("${{ matrix.archive }}" -eq "zip") {
+            Compress-Archive -Path (Join-Path $assetDir "*") -DestinationPath (Join-Path $dist "$assetName.zip") -Force
+          } else {
+            tar -czf (Join-Path $dist "$assetName.tar.gz") -C $assetDir .
+          }
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-v${{ steps.version.outputs.version }}-${{ matrix.platform }}
+          path: |
+            dist/${{ env.APP_NAME }}-v${{ steps.version.outputs.version }}-${{ matrix.platform }}.zip
+            dist/${{ env.APP_NAME }}-v${{ steps.version.outputs.version }}-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
