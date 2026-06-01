@@ -12,7 +12,7 @@ use gpui::{
 const DEFAULT_SOFT_WRAP_COLUMN: usize = 100;
 const EDITOR_PADDING: Pixels = px(16.0);
 const HEADER_HEIGHT: Pixels = px(28.0);
-const LINE_HEIGHT: Pixels = px(20.0);
+const LINE_HEIGHT: Pixels = px(24.0);
 const LINE_NUMBER_WIDTH: Pixels = px(48.0);
 const CONTENT_GAP: Pixels = px(12.0);
 const DISPLAY_COLUMN_WIDTH: Pixels = px(8.0);
@@ -202,6 +202,20 @@ pub struct RenderedLineFragment {
     pub active_cursor: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderedLineOverlay {
+    start_column: usize,
+    column_span: usize,
+    kind: RenderedLineOverlayKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderedLineOverlayKind {
+    Selection,
+    Marked,
+    Cursor { active: bool },
+}
+
 impl RenderedLine {
     pub fn text_with_cursors(&self) -> String {
         let mut text = self.text.clone();
@@ -353,6 +367,54 @@ impl RenderedLine {
         self.marked_ranges
             .iter()
             .any(|marked| marked.start < range.end && marked.end > range.start)
+    }
+
+    fn overlays(&self) -> Vec<RenderedLineOverlay> {
+        let mut overlays = Vec::new();
+        overlays.extend(
+            self.selection_ranges
+                .iter()
+                .cloned()
+                .map(|range| RenderedLineOverlay {
+                    start_column: range.start,
+                    column_span: range.end.saturating_sub(range.start),
+                    kind: RenderedLineOverlayKind::Selection,
+                }),
+        );
+        overlays.extend(
+            self.marked_ranges
+                .iter()
+                .cloned()
+                .map(|range| RenderedLineOverlay {
+                    start_column: range.start,
+                    column_span: range.end.saturating_sub(range.start),
+                    kind: RenderedLineOverlayKind::Marked,
+                }),
+        );
+
+        let mut sorted_cursor_columns = self.cursor_columns.clone();
+        sorted_cursor_columns.sort_unstable();
+        for column in sorted_cursor_columns {
+            let earlier_same_column = overlays
+                .iter()
+                .filter(|overlay| {
+                    overlay.start_column == column
+                        && matches!(overlay.kind, RenderedLineOverlayKind::Cursor { .. })
+                })
+                .count();
+            let active = earlier_same_column == 0
+                && self
+                    .active_cursor_columns
+                    .iter()
+                    .any(|active_column| *active_column == column);
+            overlays.push(RenderedLineOverlay {
+                start_column: column,
+                column_span: 0,
+                kind: RenderedLineOverlayKind::Cursor { active },
+            });
+        }
+
+        overlays
     }
 }
 
@@ -1945,10 +2007,13 @@ fn render_editor_row(line: RenderedLine) -> impl IntoElement {
         .flex()
         .gap_3()
         .h(LINE_HEIGHT)
-        .items_center()
+        .items_start()
+        .line_height(LINE_HEIGHT)
         .child(
             div()
                 .w(LINE_NUMBER_WIDTH)
+                .h(LINE_HEIGHT)
+                .line_height(LINE_HEIGHT)
                 .text_color(rgb(0x6e7681))
                 .child(if line.continuation {
                     "...".to_string()
@@ -1960,38 +2025,84 @@ fn render_editor_row(line: RenderedLine) -> impl IntoElement {
 }
 
 fn render_visual_line(line: RenderedLine) -> impl IntoElement {
-    div().w(editor_text_width()).flex().items_center().children(
-        line.visual_fragments()
-            .into_iter()
-            .map(render_line_fragment),
-    )
+    let overlays = line.overlays();
+    let background_overlays = overlays
+        .iter()
+        .filter(|overlay| {
+            matches!(
+                overlay.kind,
+                RenderedLineOverlayKind::Selection | RenderedLineOverlayKind::Marked
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let cursor_overlays = overlays
+        .into_iter()
+        .filter(|overlay| matches!(overlay.kind, RenderedLineOverlayKind::Cursor { .. }))
+        .collect::<Vec<_>>();
+
+    div()
+        .relative()
+        .w(editor_text_width())
+        .h(LINE_HEIGHT)
+        .line_height(LINE_HEIGHT)
+        .children(
+            background_overlays
+                .into_iter()
+                .map(render_background_overlay),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .w(editor_text_width())
+                .h(LINE_HEIGHT)
+                .line_height(LINE_HEIGHT)
+                .child(line.text),
+        )
+        .children(cursor_overlays.into_iter().map(render_cursor_overlay))
 }
 
-fn render_line_fragment(fragment: RenderedLineFragment) -> impl IntoElement {
-    if fragment.cursor {
-        div()
-            .w(CARET_WIDTH)
-            .h(LINE_HEIGHT)
-            .bg(if fragment.active_cursor {
-                rgb(0xf0f6fc)
-            } else {
-                rgb(0x8b949e)
-            })
-            .into_any_element()
+fn render_background_overlay(overlay: RenderedLineOverlay) -> impl IntoElement {
+    let color = match overlay.kind {
+        RenderedLineOverlayKind::Selection => rgb(0x264f78),
+        RenderedLineOverlayKind::Marked => rgb(0x3a2f14),
+        RenderedLineOverlayKind::Cursor { .. } => rgb(0x1f2328),
+    };
+
+    render_column_overlay(overlay, color.into())
+}
+
+fn render_column_overlay(overlay: RenderedLineOverlay, color: gpui::Hsla) -> impl IntoElement {
+    let width = if overlay.column_span == 0 {
+        CARET_WIDTH
     } else {
-        div()
-            .h(LINE_HEIGHT)
-            .px(px(1.0))
-            .bg(if fragment.selected {
-                rgb(0x264f78)
-            } else if fragment.marked {
-                rgb(0x3a2f14)
-            } else {
-                rgb(0x1f2328)
-            })
-            .child(fragment.text)
-            .into_any_element()
-    }
+        DISPLAY_COLUMN_WIDTH * overlay.column_span
+    };
+
+    div()
+        .absolute()
+        .top(px(0.0))
+        .left(DISPLAY_COLUMN_WIDTH * overlay.start_column)
+        .w(width)
+        .h(LINE_HEIGHT)
+        .bg(color)
+}
+
+fn render_cursor_overlay(overlay: RenderedLineOverlay) -> impl IntoElement {
+    let active = matches!(
+        overlay.kind,
+        RenderedLineOverlayKind::Cursor { active: true }
+    );
+
+    div()
+        .absolute()
+        .top(px(0.0))
+        .left(DISPLAY_COLUMN_WIDTH * overlay.start_column)
+        .w(CARET_WIDTH)
+        .h(LINE_HEIGHT)
+        .bg(if active { rgb(0xf0f6fc) } else { rgb(0x8b949e) })
 }
 
 fn render_scrollbar(scrollbar: RenderedScrollbar) -> impl IntoElement {
@@ -2521,6 +2632,40 @@ mod tests {
                     marked: false,
                     cursor: false,
                     active_cursor: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_line_overlays_keep_cursors_out_of_text_flow() {
+        let line = RenderedLine {
+            line_number: 1,
+            text: "abcd".to_string(),
+            continuation: false,
+            cursor_columns: vec![2],
+            active_cursor_columns: vec![2],
+            selection_ranges: vec![1..3],
+            marked_ranges: vec![0..1],
+        };
+
+        assert_eq!(
+            line.overlays(),
+            vec![
+                RenderedLineOverlay {
+                    start_column: 1,
+                    column_span: 2,
+                    kind: RenderedLineOverlayKind::Selection,
+                },
+                RenderedLineOverlay {
+                    start_column: 0,
+                    column_span: 1,
+                    kind: RenderedLineOverlayKind::Marked,
+                },
+                RenderedLineOverlay {
+                    start_column: 2,
+                    column_span: 0,
+                    kind: RenderedLineOverlayKind::Cursor { active: true },
                 },
             ]
         );
