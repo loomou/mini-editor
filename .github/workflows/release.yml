@@ -52,11 +52,6 @@ jobs:
             binary_path: target/release/app
             binary_name: mini-editor
             archive: tar.gz
-          - os: macos-13
-            platform: macos-x86_64
-            binary_path: target/release/app
-            binary_name: mini-editor
-            archive: tar.gz
           - os: macos-14
             platform: macos-aarch64
             binary_path: target/release/app

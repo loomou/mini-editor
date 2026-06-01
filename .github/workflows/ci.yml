@@ -54,8 +54,6 @@ jobs:
             platform: windows-x86_64
           - os: ubuntu-latest
             platform: linux-x86_64
-          - os: macos-13
-            platform: macos-x86_64
           - os: macos-14
             platform: macos-aarch64
 
