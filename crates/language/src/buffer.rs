@@ -1,74 +1,9 @@
+use crate::{BufferSnapshot, Capability, Diagnostic, SourceFile};
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::rc::Rc;
-use text::{Anchor, Buffer as TextBuffer, BufferId, BufferSnapshot as TextSnapshot, TextEdit};
+use text::{Anchor, Buffer as TextBuffer, BufferId, TextEdit};
 
 pub type BufferHandle = Rc<RefCell<Buffer>>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Capability {
-    ReadWrite,
-    ReadOnly,
-}
-
-impl Capability {
-    pub fn editable(self) -> bool {
-        matches!(self, Self::ReadWrite)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SourceFile {
-    path: PathBuf,
-}
-
-impl SourceFile {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    pub fn path(&self) -> &PathBuf {
-        &self.path
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Diagnostic {
-    pub message: String,
-    pub range: std::ops::Range<usize>,
-}
-
-#[derive(Clone, Debug)]
-pub struct BufferSnapshot {
-    pub text: TextSnapshot,
-    pub file: Option<SourceFile>,
-    pub language_name: Option<String>,
-    pub diagnostics: Vec<Diagnostic>,
-    pub capability: Capability,
-    pub saved_version: u64,
-}
-
-impl BufferSnapshot {
-    pub fn id(&self) -> BufferId {
-        self.text.id()
-    }
-
-    pub fn anchor_before(&self, offset: usize) -> Anchor {
-        self.text.anchor_before(offset)
-    }
-
-    pub fn anchor_after(&self, offset: usize) -> Anchor {
-        self.text.anchor_after(offset)
-    }
-
-    pub fn offset_for_anchor(&self, anchor: Anchor) -> Option<usize> {
-        self.text.offset_for_anchor(anchor)
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.text.version() != self.saved_version
-    }
-}
 
 #[derive(Debug)]
 pub struct Buffer {
@@ -225,7 +160,8 @@ impl Buffer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{Buffer, SourceFile};
+    use text::{Anchor, Bias, BufferId, TextEdit};
 
     #[test]
     fn buffer_tracks_dirty_state_against_saved_version() {
@@ -351,7 +287,7 @@ mod tests {
     #[test]
     fn snapshot_rejects_anchors_from_another_buffer() {
         let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello");
-        let other_anchor = Anchor::new(BufferId::new(2).unwrap(), 1, text::Bias::Left);
+        let other_anchor = Anchor::new(BufferId::new(2).unwrap(), 1, Bias::Left);
 
         assert_eq!(buffer.snapshot().offset_for_anchor(other_anchor), None);
     }

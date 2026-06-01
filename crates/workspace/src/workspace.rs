@@ -1,72 +1,15 @@
-use project::Project;
-
-pub use project::ProjectPath;
-pub use ui::{CommandOutcome, EditorCommand, EditorView, RenderedEditor};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkspaceCommand {
-    Editor(EditorCommand),
-    SaveAll,
-    CloseActiveEditor,
-    SaveAndCloseActiveEditor,
-    DiscardAndCloseActiveEditor,
-    ReloadActiveEditor,
-    ForceReloadActiveEditor,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkspaceCommandOutcome {
-    pub editor: Option<CommandOutcome>,
-    pub saved_paths: Vec<ProjectPath>,
-    pub closed_path: Option<ProjectPath>,
-    pub reloaded_path: Option<ProjectPath>,
-    pub reload_changed_text: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RenderedWorkspace {
-    pub tabs: Vec<RenderedTab>,
-    pub active_editor: Option<RenderedEditor>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RenderedTab {
-    pub path: ProjectPath,
-    pub title: String,
-    pub is_active: bool,
-    pub is_dirty: bool,
-    pub has_external_change: bool,
-}
-
-impl RenderedTab {
-    pub fn label_text(&self) -> String {
-        let active_marker = if self.is_active { '>' } else { ' ' };
-        let dirty_marker = if self.is_dirty { '*' } else { ' ' };
-        let external_marker = if self.has_external_change { '!' } else { ' ' };
-        format!(
-            "{active_marker}{dirty_marker}{external_marker} {}",
-            self.title
-        )
-    }
-}
+use crate::{
+    ReloadOutcome, RenderedTab, RenderedWorkspace, WorkspaceCommand, WorkspaceCommandOutcome,
+    editor_entry::WorkspaceEditor,
+};
+use project::{Project, ProjectPath};
+use ui::{EditorView, RenderedEditor};
 
 #[derive(Debug, Default)]
 pub struct Workspace {
     project: Project,
     open_editors: Vec<WorkspaceEditor>,
     active_index: Option<usize>,
-}
-
-#[derive(Debug)]
-struct WorkspaceEditor {
-    path: ProjectPath,
-    view: EditorView,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReloadOutcome {
-    pub path: ProjectPath,
-    pub changed_text: bool,
 }
 
 impl Workspace {
@@ -430,7 +373,8 @@ enum DirtyClosePolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{EditorCommand, Workspace, WorkspaceCommand};
+    use project::ProjectPath;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -445,102 +389,6 @@ mod tests {
             .join("target")
             .join("mini_workspace_tests")
             .join(format!("{name}-{unique}.txt"))
-    }
-
-    #[test]
-    fn save_all_clears_active_editor_dirty_marker() {
-        let file_path = test_file_path("save-all");
-        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
-        std::fs::write(&file_path, "hello world").unwrap();
-
-        let path = ProjectPath::new(1, file_path.clone());
-        let mut workspace = Workspace::new();
-        workspace.open_editor_from_file(path.clone()).unwrap();
-
-        assert_eq!(
-            workspace
-                .active_rendered_editor(None)
-                .unwrap()
-                .header_text(),
-            format!("  {}", file_path.display())
-        );
-
-        workspace
-            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('/')))
-            .unwrap();
-
-        assert_eq!(
-            workspace
-                .active_rendered_editor(None)
-                .unwrap()
-                .header_text(),
-            format!("* {}", file_path.display())
-        );
-        assert!(workspace.project().has_dirty_buffers());
-
-        let outcome = workspace
-            .dispatch_command(WorkspaceCommand::SaveAll)
-            .unwrap();
-
-        assert_eq!(outcome.saved_paths, vec![path]);
-        assert_eq!(outcome.closed_path, None);
-        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "/hello world");
-        assert_eq!(
-            workspace
-                .active_rendered_editor(None)
-                .unwrap()
-                .header_text(),
-            format!("  {}", file_path.display())
-        );
-        assert!(!workspace.project().has_dirty_buffers());
-    }
-
-    #[test]
-    fn editor_command_requires_an_active_editor() {
-        let mut workspace = Workspace::new();
-
-        let error = workspace
-            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::Delete))
-            .unwrap_err();
-
-        assert_eq!(error, "workspace has no active editor");
-    }
-
-    #[test]
-    fn workspace_dispatches_editor_undo_and_redo_commands() {
-        let path = ProjectPath::new(1, "src/main.rs");
-        let mut workspace = Workspace::new();
-        workspace.open_editor(path, "hello");
-
-        workspace
-            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('/')))
-            .unwrap();
-        assert_eq!(
-            workspace.active_rendered_editor(None).unwrap().lines[0].text,
-            "/hello"
-        );
-
-        let undo = workspace
-            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::Undo))
-            .unwrap()
-            .editor
-            .unwrap();
-        assert!(undo.changed_text);
-        assert_eq!(
-            workspace.active_rendered_editor(None).unwrap().lines[0].text,
-            "hello"
-        );
-
-        let redo = workspace
-            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::Redo))
-            .unwrap()
-            .editor
-            .unwrap();
-        assert!(redo.changed_text);
-        assert_eq!(
-            workspace.active_rendered_editor(None).unwrap().lines[0].text,
-            "/hello"
-        );
     }
 
     #[test]
@@ -595,28 +443,6 @@ mod tests {
             workspace.active_rendered_editor(None).unwrap().lines[0].text,
             "/first"
         );
-    }
-
-    #[test]
-    fn rendered_workspace_lists_tabs_with_active_and_dirty_state() {
-        let first = ProjectPath::new(1, "src/first.rs");
-        let second = ProjectPath::new(1, "src/second.rs");
-        let mut workspace = Workspace::new();
-
-        workspace.open_editor(first.clone(), "first");
-        workspace
-            .dispatch_command(WorkspaceCommand::Editor(EditorCommand::InsertChar('/')))
-            .unwrap();
-        workspace.open_editor(second.clone(), "second");
-
-        let rendered = workspace.rendered_workspace(None);
-
-        assert_eq!(rendered.tabs.len(), 2);
-        assert_eq!(rendered.tabs[0].path, first);
-        assert_eq!(rendered.tabs[0].label_text(), " *  src/first.rs");
-        assert_eq!(rendered.tabs[1].path, second);
-        assert_eq!(rendered.tabs[1].label_text(), ">   src/second.rs");
-        assert_eq!(rendered.active_editor.unwrap().title, "src/second.rs");
     }
 
     #[test]
@@ -697,41 +523,6 @@ mod tests {
         );
         assert_eq!(workspace.open_paths(), vec![path]);
         assert!(workspace.project().has_dirty_buffers());
-    }
-
-    #[test]
-    fn rendered_workspace_marks_tabs_with_external_file_changes() {
-        let file_path = test_file_path("external-change-tab");
-        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
-        std::fs::write(&file_path, "old").unwrap();
-
-        let path = ProjectPath::new(1, file_path.clone());
-        let mut workspace = Workspace::new();
-        workspace.open_editor_from_file(path.clone()).unwrap();
-
-        assert_eq!(
-            workspace.rendered_workspace(None).tabs[0].label_text(),
-            format!(">   {}", file_path.display())
-        );
-
-        std::fs::write(&file_path, "changed length").unwrap();
-
-        let rendered = workspace.rendered_workspace(None);
-
-        assert!(rendered.tabs[0].has_external_change);
-        assert_eq!(
-            rendered.tabs[0].label_text(),
-            format!("> ! {}", file_path.display())
-        );
-
-        workspace.reload_active_editor().unwrap();
-
-        let rendered = workspace.rendered_workspace(None);
-        assert!(!rendered.tabs[0].has_external_change);
-        assert_eq!(
-            rendered.tabs[0].label_text(),
-            format!(">   {}", file_path.display())
-        );
     }
 
     #[test]

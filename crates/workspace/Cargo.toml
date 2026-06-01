@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-path = "src/workspace.rs"
 doctest = false
 
 [dependencies]

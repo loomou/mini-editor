@@ -1,137 +1,9 @@
-use language::{BufferHandle, BufferSnapshot, Capability};
+use crate::{Excerpt, ExcerptRange, MultiBufferAnchor, MultiBufferEdit, MultiBufferSnapshot};
+use language::{BufferHandle, Capability};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::rc::Rc;
 use text::{Anchor, BufferId, TextEdit};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExcerptRange {
-    pub context: Range<usize>,
-    pub primary: Range<usize>,
-}
-
-impl ExcerptRange {
-    pub fn new(context: Range<usize>) -> Self {
-        Self {
-            primary: context.clone(),
-            context,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Excerpt {
-    pub path_key: String,
-    pub buffer_id: BufferId,
-    pub range: ExcerptRange,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MultiBufferAnchor {
-    buffer_id: BufferId,
-    anchor_index: usize,
-}
-
-impl MultiBufferAnchor {
-    pub fn buffer_id(self) -> BufferId {
-        self.buffer_id
-    }
-
-    pub fn anchor_index(self) -> usize {
-        self.anchor_index
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MultiBufferEdit {
-    pub range: Range<usize>,
-    pub replacement: Rc<str>,
-}
-
-#[derive(Clone, Debug)]
-pub struct MultiBufferSnapshot {
-    excerpts: Vec<Excerpt>,
-    buffers: BTreeMap<BufferId, BufferSnapshot>,
-    text: String,
-    capability: Capability,
-}
-
-impl MultiBufferSnapshot {
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub fn excerpts(&self) -> &[Excerpt] {
-        &self.excerpts
-    }
-
-    pub fn buffer(&self, id: BufferId) -> Option<&BufferSnapshot> {
-        self.buffers.get(&id)
-    }
-
-    pub fn capability(&self) -> Capability {
-        self.capability
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.buffers.values().any(BufferSnapshot::is_dirty)
-    }
-
-    pub fn anchor_before(&self, offset: usize) -> Option<Anchor> {
-        let (buffer_id, buffer_offset) = self.locate(offset)?;
-        self.buffers
-            .get(&buffer_id)
-            .map(|buffer| buffer.anchor_before(buffer_offset))
-    }
-
-    pub fn anchor_after(&self, offset: usize) -> Option<Anchor> {
-        let (buffer_id, buffer_offset) = self.locate(offset)?;
-        self.buffers
-            .get(&buffer_id)
-            .map(|buffer| buffer.anchor_after(buffer_offset))
-    }
-
-    pub fn offset_for_anchor(&self, anchor: Anchor) -> Option<usize> {
-        let buffer = self.buffers.get(&anchor.buffer_id())?;
-        let buffer_offset = buffer.offset_for_anchor(anchor)?;
-        let mut cursor = 0;
-
-        for excerpt in &self.excerpts {
-            let len = excerpt.range.context.end - excerpt.range.context.start;
-            if excerpt.buffer_id == anchor.buffer_id()
-                && buffer_offset >= excerpt.range.context.start
-                && buffer_offset <= excerpt.range.context.end
-            {
-                return Some(cursor + buffer_offset - excerpt.range.context.start);
-            }
-
-            cursor += len;
-            if cursor < self.text.len() {
-                cursor += 1;
-            }
-        }
-
-        None
-    }
-
-    fn locate(&self, offset: usize) -> Option<(BufferId, usize)> {
-        let mut cursor = 0;
-        for excerpt in &self.excerpts {
-            let len = excerpt.range.context.end - excerpt.range.context.start;
-            if offset <= cursor + len {
-                return Some((
-                    excerpt.buffer_id,
-                    excerpt.range.context.start + offset - cursor,
-                ));
-            }
-            cursor += len;
-            if cursor < self.text.len() {
-                cursor += 1;
-            }
-        }
-        None
-    }
-}
 
 #[derive(Debug)]
 pub struct MultiBuffer {
@@ -188,12 +60,7 @@ impl MultiBuffer {
             .collect::<Vec<_>>()
             .join("\n");
 
-        MultiBufferSnapshot {
-            excerpts: self.excerpts.clone(),
-            buffers,
-            text,
-            capability: self.capability,
-        }
+        MultiBufferSnapshot::new(self.excerpts.clone(), buffers, text, self.capability)
     }
 
     pub fn track_anchor_before(&mut self, offset: usize) -> Option<MultiBufferAnchor> {
@@ -293,10 +160,7 @@ impl MultiBuffer {
             .get(&buffer_id)?
             .borrow_mut()
             .track_anchor(anchor);
-        Some(MultiBufferAnchor {
-            buffer_id,
-            anchor_index,
-        })
+        Some(MultiBufferAnchor::new(buffer_id, anchor_index))
     }
 
     pub fn undo(&mut self) -> Result<bool, String> {
@@ -408,8 +272,9 @@ impl MultiBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{MultiBuffer, MultiBufferEdit};
     use language::{Buffer, SourceFile};
+    use text::BufferId;
 
     #[test]
     fn singleton_exposes_buffer_text() {
@@ -482,22 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reports_dirty_when_any_backing_buffer_is_dirty() {
-        let buffer = Buffer::from_file(
-            BufferId::new(1).unwrap(),
-            SourceFile::new("src/main.rs"),
-            "hello world",
-        );
-        let mut multibuffer = MultiBuffer::singleton("src/main.rs", buffer.into_handle());
-
-        assert!(!multibuffer.snapshot().is_dirty());
-
-        multibuffer.edit(6..11, "zed").unwrap();
-
-        assert!(multibuffer.snapshot().is_dirty());
-    }
-
-    #[test]
     fn refresh_updates_singleton_excerpt_after_external_buffer_change() {
         let buffer = Buffer::from_file(
             BufferId::new(1).unwrap(),
@@ -511,84 +360,5 @@ mod tests {
         multibuffer.refresh();
 
         assert_eq!(multibuffer.snapshot().text(), "new longer text");
-    }
-
-    #[test]
-    fn snapshot_creates_and_resolves_anchors_in_singleton_excerpt() {
-        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world").into_handle();
-        let mut multibuffer = MultiBuffer::singleton("scratch", buffer.clone());
-        let anchor = multibuffer.snapshot().anchor_after(6).unwrap();
-        let tracked_anchor = buffer.borrow_mut().track_anchor(anchor);
-
-        multibuffer.edit(6..11, "zed").unwrap();
-
-        let anchor = buffer.borrow().tracked_anchor(tracked_anchor).unwrap();
-        assert_eq!(multibuffer.snapshot().offset_for_anchor(anchor), Some(9));
-    }
-
-    #[test]
-    fn snapshot_resolves_anchors_inside_later_excerpts() {
-        let first = Buffer::local(BufferId::new(1).unwrap(), "alpha").into_handle();
-        let second = Buffer::local(BufferId::new(2).unwrap(), "beta").into_handle();
-        let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
-        multibuffer.add_excerpt("first", first, ExcerptRange::new(0..5));
-        multibuffer.add_excerpt("second", second.clone(), ExcerptRange::new(0..4));
-
-        let snapshot = multibuffer.snapshot();
-        assert_eq!(snapshot.text(), "alpha\nbeta");
-
-        let anchor = snapshot.anchor_before(8).unwrap();
-
-        assert_eq!(anchor.buffer_id(), BufferId::new(2).unwrap());
-        assert_eq!(
-            second.borrow().snapshot().offset_for_anchor(anchor),
-            Some(2)
-        );
-        assert_eq!(snapshot.offset_for_anchor(anchor), Some(8));
-    }
-
-    #[test]
-    fn snapshot_does_not_resolve_anchor_outside_any_excerpt() {
-        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world").into_handle();
-        let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
-        multibuffer.add_excerpt("scratch", buffer.clone(), ExcerptRange::new(0..5));
-
-        let anchor = buffer.borrow().snapshot().anchor_after(8);
-
-        assert_eq!(multibuffer.snapshot().offset_for_anchor(anchor), None);
-    }
-
-    #[test]
-    fn tracked_anchor_moves_through_singleton_edits() {
-        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world").into_handle();
-        let mut multibuffer = MultiBuffer::singleton("scratch", buffer);
-        let anchor = multibuffer.track_anchor_after(6).unwrap();
-
-        multibuffer.edit(6..11, "zed").unwrap();
-
-        assert_eq!(multibuffer.offset_for_tracked_anchor(anchor), Some(9));
-    }
-
-    #[test]
-    fn tracked_anchor_can_start_in_later_excerpt() {
-        let first = Buffer::local(BufferId::new(1).unwrap(), "alpha").into_handle();
-        let second = Buffer::local(BufferId::new(2).unwrap(), "beta").into_handle();
-        let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
-        multibuffer.add_excerpt("first", first, ExcerptRange::new(0..5));
-        multibuffer.add_excerpt("second", second, ExcerptRange::new(0..4));
-
-        let anchor = multibuffer.track_anchor_before(8).unwrap();
-
-        assert_eq!(anchor.buffer_id(), BufferId::new(2).unwrap());
-        assert_eq!(anchor.anchor_index(), 0);
-        assert_eq!(multibuffer.offset_for_tracked_anchor(anchor), Some(8));
-    }
-
-    #[test]
-    fn tracking_anchor_outside_multibuffer_returns_none() {
-        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello").into_handle();
-        let mut multibuffer = MultiBuffer::singleton("scratch", buffer);
-
-        assert_eq!(multibuffer.track_anchor_after(99), None);
     }
 }
