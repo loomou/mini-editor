@@ -18,7 +18,7 @@ jobs:
   approval:
     name: Wait for CI approval
     runs-on: ubuntu-latest
-    environment: ci
+    environment: ci-approval
 
     steps:
       - name: Approved
