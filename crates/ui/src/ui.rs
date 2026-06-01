@@ -1181,6 +1181,7 @@ impl EditorView {
         } else {
             self.editor.insert_text(text.to_string())?;
         }
+        self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
         self.linewise_clipboard_text = None;
 
         let after_text = self.editor.snapshot().text().to_string();
@@ -2758,6 +2759,48 @@ mod tests {
     }
 
     #[test]
+    fn view_shift_vertical_movement_extends_selection_through_empty_lines() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let mut view = EditorView::new(editor);
+        view.editor.select(3..3);
+
+        view.dispatch_command(EditorCommand::MoveDown { extend: true })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "abc[d]");
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+
+        view.dispatch_command(EditorCommand::MoveDown { extend: true })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "abc[d]");
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+        assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[wxy]|z");
+    }
+
+    #[test]
+    fn view_shift_vertical_movement_extends_reversed_selection_through_empty_lines() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let mut view = EditorView::new(editor);
+        view.editor.select(9..9);
+
+        view.dispatch_command(EditorCommand::MoveUp { extend: true })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+        assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[wxy]z");
+
+        view.dispatch_command(EditorCommand::MoveUp { extend: true })
+            .unwrap();
+        assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "abc[|d]");
+        assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+        assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[wxy]z");
+    }
+
+    #[test]
     fn view_renders_only_visible_viewport_rows() {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -2819,6 +2862,49 @@ mod tests {
         assert_eq!(view.viewport_start_row(), 2);
         assert!(view.editor.selected_text().is_empty());
         assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|2");
+    }
+
+    #[test]
+    fn paste_reveals_active_cursor() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(2);
+
+        view.dispatch_paste_text("alpha\nbeta\ngamma\n").unwrap();
+
+        assert_eq!(view.viewport_start_row(), 2);
+        assert_eq!(
+            view.rendered_lines(None)
+                .into_iter()
+                .map(|line| line.text_with_overlays())
+                .collect::<Vec<_>>(),
+            vec!["gamma".to_string(), "|0".to_string()]
+        );
+    }
+
+    #[test]
+    fn linewise_paste_reveals_active_cursor() {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "0\n1\n2\n3").into_handle(),
+        );
+        let mut view = EditorView::new(editor).with_viewport_rows(2);
+        view.editor.select(6..6);
+        view.linewise_clipboard_text = Some("alpha\nbeta\n".to_string());
+
+        view.dispatch_paste_text("alpha\nbeta\n").unwrap();
+
+        assert_eq!(view.linewise_clipboard_text, None);
+        assert_eq!(view.viewport_start_row(), 4);
+        assert_eq!(
+            view.rendered_lines(None)
+                .into_iter()
+                .map(|line| line.text_with_overlays())
+                .collect::<Vec<_>>(),
+            vec!["beta".to_string(), "|3".to_string()]
+        );
     }
 
     #[test]
@@ -3223,6 +3309,27 @@ mod tests {
             }),
             6
         );
+
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(2).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let view = EditorView::new(editor);
+
+        assert_eq!(
+            view.utf8_offset_for_mouse_position(Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            }),
+            4
+        );
+        assert_eq!(
+            view.utf8_offset_for_mouse_position(Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            }),
+            7
+        );
     }
 
     #[test]
@@ -3429,6 +3536,173 @@ mod tests {
     }
 
     #[gpui::test]
+    fn gpui_mouse_click_clamps_empty_line_and_line_end(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+        });
+
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "xy|");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_shift_click_clamps_empty_line_and_line_end(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            Modifiers::default(),
+        );
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+        });
+
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            Modifiers::default(),
+        );
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]|");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_reversed_shift_click_clamps_empty_line_and_line_end(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy\nzz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 3,
+            },
+            Modifiers::default(),
+        );
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]");
+            assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "[zz]");
+        });
+
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 3,
+            },
+            Modifiers::default(),
+        );
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "xy|");
+            assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "[zz]");
+        });
+    }
+
+    #[gpui::test]
     fn gpui_simulated_platform_input_edits_view(cx: &mut gpui::TestAppContext) {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -3476,6 +3750,104 @@ mod tests {
             assert_eq!(view.text(), "ab\ne");
             assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[ab]");
             assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[e]|");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_vertical_movement_preserves_column_goal_through_empty_lines(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("right right right down down");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abcd".to_string(), "".to_string(), "wxy|z".to_string()]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_shift_vertical_movement_extends_selection_through_empty_lines(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("right right right shift-down shift-down");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abc[d]".to_string(), "".to_string(), "[wxy]|z".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "d\n\nwxy");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_reversed_shift_vertical_movement_extends_selection_through_empty_lines(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("down down right right right shift-up shift-up");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abc[|d]".to_string(), "".to_string(), "[wxy]z".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "d\n\nwxy");
         });
     }
 
@@ -3696,6 +4068,224 @@ mod tests {
 
         view.update(cx, |view, _| {
             assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "de|f");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_undo_redo_selection_restores_clamped_shift_click(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+        });
+
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(2).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_click(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]|");
+
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]|");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_undo_redo_selection_restores_empty_line_shift_vertical_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("right right right shift-down shift-down secondary-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abc[d]".to_string(), "|".to_string(), "wxyz".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "d\n");
+        });
+
+        cx.simulate_keystrokes("secondary-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abc|d".to_string(), "".to_string(), "wxyz".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "");
+        });
+
+        cx.simulate_keystrokes("secondary-shift-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abc[d]".to_string(), "|".to_string(), "wxyz".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "d\n");
+        });
+
+        cx.simulate_keystrokes("secondary-shift-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abc[d]".to_string(), "".to_string(), "[wxy]|z".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "d\n\nwxy");
+        });
+
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(2).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("down down right right right shift-up shift-up secondary-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abcd".to_string(), "|".to_string(), "[wxy]z".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "\nwxy");
+        });
+
+        cx.simulate_keystrokes("secondary-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abcd".to_string(), "".to_string(), "wxy|z".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "");
+        });
+
+        cx.simulate_keystrokes("secondary-shift-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abcd".to_string(), "|".to_string(), "[wxy]z".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "\nwxy");
+        });
+
+        cx.simulate_keystrokes("secondary-shift-u");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abc[|d]".to_string(), "".to_string(), "[wxy]z".to_string()]
+            );
+            assert_eq!(view.editor.selected_text(), "d\n\nwxy");
         });
     }
 
@@ -4212,6 +4802,121 @@ mod tests {
     }
 
     #[gpui::test]
+    fn gpui_empty_line_shift_selection_uses_regular_clipboard_paths(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("right right right shift-down shift-down secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("d\n\nwxy".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abcd\n\nwxyz");
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(view.editor.selected_text(), "d\n\nwxy");
+        });
+
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("d\n\nwxy".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abcz");
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "abc|z");
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abcd\n\nwxyz");
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abc[d]".to_string(), "".to_string(), "[wxy]|z".to_string()]
+            );
+        });
+
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(2).unwrap(), "abcd\n\nwxyz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("down down right right right shift-up shift-up secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("d\n\nwxy".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(view.editor.selected_text(), "d\n\nwxy");
+        });
+
+        cx.write_to_clipboard(ClipboardItem::new_string("Q\nR".to_string()));
+        cx.simulate_keystrokes("secondary-v");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abcQ\nRz");
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abcQ".to_string(), "R|z".to_string()]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abcd\n\nwxyz");
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abc[|d]".to_string(), "".to_string(), "[wxy]z".to_string()]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-y");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abcQ\nRz");
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["abcQ".to_string(), "R|z".to_string()]
+            );
+        });
+    }
+
+    #[gpui::test]
     fn gpui_empty_selection_copy_and_cut_use_current_line(cx: &mut gpui::TestAppContext) {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -4260,6 +4965,211 @@ mod tests {
         view.update(cx, |view, _| {
             assert_eq!(view.text(), "one\nthree");
             assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|three");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_multi_cursor_empty_selection_copy_and_cut_deduplicates_lines(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "one\ntwo\nthree\nfour").into_handle(),
+        );
+        editor.select_ranges(vec![1..1, 2..2, 5..5, 16..16]);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("one\ntwo\nfour\n".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "one\ntwo\nthree\nfour");
+            assert_eq!(
+                view.linewise_clipboard_text,
+                Some("one\ntwo\nfour\n".to_string())
+            );
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "o|n|e".to_string(),
+                    "t|wo".to_string(),
+                    "three".to_string(),
+                    "fo|ur".to_string(),
+                ]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("one\ntwo\nfour\n".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "three");
+            assert_eq!(
+                view.linewise_clipboard_text,
+                Some("one\ntwo\nfour\n".to_string())
+            );
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "||three|"
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "one\ntwo\nthree\nfour");
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "[one]".to_string(),
+                    "[|two]".to_string(),
+                    "|three".to_string(),
+                    "[four]|".to_string(),
+                ]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-y");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "three");
+            assert_eq!(
+                view.rendered_lines(None)[0].text_with_overlays(),
+                "||three|"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_clamped_rectangular_selection_copy_and_cut_use_selected_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        editor.select_display_rectangle(0, 0, 2, 8, None);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![0..3, 4..4, 5..7]
+            );
+            assert_eq!(view.editor.selected_text(), "abcxy");
+        });
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcxy".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abc\n\nxy");
+            assert_eq!(view.linewise_clipboard_text, None);
+        });
+
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcxy".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "\n");
+            assert_eq!(view.linewise_clipboard_text, None);
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abc\n\nxy");
+            assert_eq!(view.editor.selected_text(), "abcxy");
+            assert_eq!(view.linewise_clipboard_text, None);
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_clamped_rectangular_selection_paste_replaces_each_range(cx: &mut gpui::TestAppContext) {
+        let mut editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        editor.select_display_rectangle(0, 0, 2, 8, None);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        cx.write_to_clipboard(ClipboardItem::new_string("Z".to_string()));
+        cx.simulate_keystrokes("secondary-v");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "Z\nZ\nZ");
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["Z|".to_string(), "Z|".to_string(), "Z|".to_string()]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abc\n\nxy");
+            assert_eq!(view.editor.selected_text(), "abcxy");
+        });
+
+        cx.write_to_clipboard(ClipboardItem::new_string("A\nB\nC".to_string()));
+        cx.simulate_keystrokes("secondary-v");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "A\nB\nC");
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["A|".to_string(), "B|".to_string(), "C|".to_string()]
+            );
         });
     }
 
@@ -4525,6 +5435,85 @@ mod tests {
     }
 
     #[gpui::test]
+    fn gpui_clamped_rectangular_carets_linewise_paste_at_line_starts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "alpha\nbeta\ngamma\none\n\nxy").into_handle(),
+        );
+        editor.select_ranges(vec![0..0, 6..6, 11..11]);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alpha\nbeta\ngamma\n".to_string())
+        );
+
+        view.update(cx, |view, _| {
+            view.editor.select_display_rectangle(3, 8, 5, 8, None);
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![20..20, 21..21, 24..24]
+            );
+        });
+        cx.simulate_keystrokes("secondary-v");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.text(),
+                "alpha\nbeta\ngamma\nalpha\none\nbeta\n\ngamma\nxy"
+            );
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
+                    "gamma".to_string(),
+                    "alpha".to_string(),
+                    "|one".to_string(),
+                    "beta".to_string(),
+                    "|".to_string(),
+                    "gamma".to_string(),
+                    "|xy".to_string(),
+                ]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\nbeta\ngamma\none\n\nxy");
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![17..17, 21..21, 22..22]
+            );
+        });
+    }
+
+    #[gpui::test]
     fn gpui_mouse_click_moves_cursor_and_shift_click_extends_selection(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4710,6 +5699,663 @@ mod tests {
     }
 
     #[gpui::test]
+    fn gpui_alt_drag_clamps_empty_line_and_line_end_history(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        let modifiers = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+
+        view.update(cx, |view, _| {
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.rectangular_selection_start, None);
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["[abc]|".to_string(), "|".to_string(), "[xy]|".to_string()]
+            );
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![0..3, 4..4, 5..7]
+            );
+        });
+
+        view.update(cx, |view, _| {
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+            assert_eq!(view.editor.selected_text(), "");
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![0..3, 4..4, 5..7]
+            );
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]|");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_alt_drag_clamped_selection_copy_and_paste(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        let modifiers = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcxy".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abc\n\nxy");
+            assert_eq!(view.linewise_clipboard_text, None);
+        });
+
+        cx.simulate_keystrokes("secondary-v");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abcxy\nabcxy\nabcxy");
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "abcxy|".to_string(),
+                    "abcxy|".to_string(),
+                    "abcxy|".to_string()
+                ]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abc\n\nxy");
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![0..3, 4..4, 5..7]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_reversed_alt_drag_clamped_selection_copy_and_cut(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        let modifiers = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![0..3, 4..4, 5..7]
+            );
+            assert_eq!(view.editor.selected_text(), "abcxy");
+        });
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcxy".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abc\n\nxy");
+            assert_eq!(view.linewise_clipboard_text, None);
+        });
+
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcxy".to_string())
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "\n");
+            assert_eq!(view.linewise_clipboard_text, None);
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "abc\n\nxy");
+            assert_eq!(view.editor.selected_text(), "abcxy");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_alt_drag_clamped_carets_linewise_paste(cx: &mut gpui::TestAppContext) {
+        let mut editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "alpha\nbeta\ngamma\none\n\nxy").into_handle(),
+        );
+        editor.select_ranges(vec![0..0, 6..6, 11..11]);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alpha\nbeta\ngamma\n".to_string())
+        );
+
+        let modifiers = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 3,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 5,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 5,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![20..20, 21..21, 24..24]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-v");
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.text(),
+                "alpha\nbeta\ngamma\nalpha\none\nbeta\n\ngamma\nxy"
+            );
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
+                    "gamma".to_string(),
+                    "alpha".to_string(),
+                    "|one".to_string(),
+                    "beta".to_string(),
+                    "|".to_string(),
+                    "gamma".to_string(),
+                    "|xy".to_string(),
+                ]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\nbeta\ngamma\none\n\nxy");
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![17..17, 21..21, 22..22]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_reversed_alt_drag_clamped_carets_linewise_paste(cx: &mut gpui::TestAppContext) {
+        let mut editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "alpha\nbeta\ngamma\none\n\nxy").into_handle(),
+        );
+        editor.select_ranges(vec![0..0, 6..6, 11..11]);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alpha\nbeta\ngamma\n".to_string())
+        );
+
+        let modifiers = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 5,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 3,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 3,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.rectangular_selection_start, None);
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![20..20, 21..21, 24..24]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-v");
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.text(),
+                "alpha\nbeta\ngamma\nalpha\none\nbeta\n\ngamma\nxy"
+            );
+            assert_eq!(view.linewise_clipboard_text, None);
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
+                    "gamma".to_string(),
+                    "alpha".to_string(),
+                    "|one".to_string(),
+                    "beta".to_string(),
+                    "|".to_string(),
+                    "gamma".to_string(),
+                    "|xy".to_string(),
+                ]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\nbeta\ngamma\none\n\nxy");
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![17..17, 21..21, 22..22]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_alt_drag_external_mismatched_lines_pastes_full_text(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "alpha\nbeta\ngamma\none\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+
+        let modifiers = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 3,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 5,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 5,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![20..20, 21..21, 24..24]
+            );
+            assert_eq!(view.linewise_clipboard_text, None);
+        });
+
+        cx.write_to_clipboard(ClipboardItem::new_string("red\ngreen".to_string()));
+        cx.simulate_keystrokes("secondary-v");
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.text(),
+                "alpha\nbeta\ngamma\nonered\ngreen\nred\ngreen\nxyred\ngreen"
+            );
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
+                    "gamma".to_string(),
+                    "onered".to_string(),
+                    "green|".to_string(),
+                    "red".to_string(),
+                    "green|".to_string(),
+                    "xyred".to_string(),
+                    "green|".to_string(),
+                ]
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-z");
+        view.update(cx, |view, _| {
+            assert_eq!(view.text(), "alpha\nbeta\ngamma\none\n\nxy");
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![20..20, 21..21, 24..24]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_reversed_alt_drag_clamps_empty_line_and_line_end_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        let modifiers = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            modifiers,
+        );
+
+        view.update(cx, |view, _| {
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.rectangular_selection_start, None);
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![0..3, 4..4, 5..7]
+            );
+            assert_eq!(
+                view.rendered_lines(None)
+                    .into_iter()
+                    .map(|line| line.text_with_overlays())
+                    .collect::<Vec<_>>(),
+                vec!["[abc]|".to_string(), "|".to_string(), "[xy]|".to_string()]
+            );
+        });
+
+        view.update(cx, |view, _| {
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+            assert_eq!(view.editor.selected_text(), "");
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(
+                view.editor
+                    .resolved_selections()
+                    .iter()
+                    .map(Selection::range)
+                    .collect::<Vec<_>>(),
+                vec![0..3, 4..4, 5..7]
+            );
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]|");
+        });
+    }
+
+    #[gpui::test]
     fn gpui_mouse_drag_extends_selection(cx: &mut gpui::TestAppContext) {
         let editor = EditorModel::for_buffer(
             "scratch",
@@ -4766,6 +6412,232 @@ mod tests {
             view.dispatch_command(EditorCommand::RedoSelection).unwrap();
             assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "a[bc]");
             assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "[de]|f");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_mouse_drag_clamps_empty_line_and_line_end_history(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+        });
+
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(2).unwrap(), "abc\n\nxy").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP,
+                y: EDITOR_PADDING + HEADER_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]|");
+
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "[abc]");
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]|");
+        });
+    }
+
+    #[gpui::test]
+    fn gpui_reversed_mouse_drag_clamps_empty_line_and_line_end_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "abc\n\nxy\nzz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 3,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]");
+            assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "[zz]");
+
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "|");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "[xy]");
+            assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "[zz]");
+        });
+
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(2).unwrap(), "abc\n\nxy\nzz").into_handle(),
+        );
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.as_ref().unwrap().clone();
+            window.focus(&focus_handle);
+            window.activate_window();
+        });
+        cx.simulate_mouse_down(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 2,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 3,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            Point {
+                x: EDITOR_PADDING + LINE_NUMBER_WIDTH + CONTENT_GAP + DISPLAY_COLUMN_WIDTH * 8,
+                y: EDITOR_PADDING + HEADER_HEIGHT + LINE_HEIGHT * 2,
+            },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        view.update(cx, |view, _| {
+            assert!(!view.selecting_with_mouse);
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "xy|");
+            assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "[zz]");
+
+            view.dispatch_command(EditorCommand::UndoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[0].text_with_overlays(), "|abc");
+            assert!(!view.editor.undo_selection());
+
+            view.dispatch_command(EditorCommand::RedoSelection).unwrap();
+            assert_eq!(view.rendered_lines(None)[1].text_with_overlays(), "");
+            assert_eq!(view.rendered_lines(None)[2].text_with_overlays(), "xy|");
+            assert_eq!(view.rendered_lines(None)[3].text_with_overlays(), "[zz]");
         });
     }
 
