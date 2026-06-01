@@ -4,9 +4,10 @@ use std::{ops::Range, time::Duration};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
     Entity, FocusHandle, GlobalElementId, InspectorElementId, IntoElement, KeyDownEvent, Keystroke,
-    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, Style, UTF16Selection, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, rgb, size,
+    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, Window, WindowBounds, WindowOptions, canvas, div, fill, point, prelude::*, px,
+    rgb, size,
 };
 
 const DEFAULT_SOFT_WRAP_COLUMN: usize = 100;
@@ -214,6 +215,12 @@ enum RenderedLineOverlayKind {
     Selection,
     Marked,
     Cursor { active: bool },
+}
+
+struct VisualLinePaintState {
+    line: ShapedLine,
+    background_quads: Vec<PaintQuad>,
+    cursor_quads: Vec<PaintQuad>,
 }
 
 impl RenderedLine {
@@ -426,6 +433,10 @@ fn byte_offset_for_display_column(text: &str, display_column: usize) -> Option<u
     text.char_indices()
         .nth(display_column)
         .map(|(offset, _)| offset)
+}
+
+fn byte_offset_for_display_column_or_end(text: &str, display_column: usize) -> usize {
+    byte_offset_for_display_column(text, display_column).unwrap_or(text.len())
 }
 
 fn display_column_for_byte_offset(text: &str, byte_offset: usize) -> usize {
@@ -2025,84 +2036,127 @@ fn render_editor_row(line: RenderedLine) -> impl IntoElement {
 }
 
 fn render_visual_line(line: RenderedLine) -> impl IntoElement {
-    let overlays = line.overlays();
-    let background_overlays = overlays
-        .iter()
-        .filter(|overlay| {
-            matches!(
-                overlay.kind,
-                RenderedLineOverlayKind::Selection | RenderedLineOverlayKind::Marked
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let cursor_overlays = overlays
-        .into_iter()
-        .filter(|overlay| matches!(overlay.kind, RenderedLineOverlayKind::Cursor { .. }))
-        .collect::<Vec<_>>();
-
-    div()
-        .relative()
-        .w(editor_text_width())
-        .h(LINE_HEIGHT)
-        .line_height(LINE_HEIGHT)
-        .children(
-            background_overlays
-                .into_iter()
-                .map(render_background_overlay),
-        )
-        .child(
-            div()
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .w(editor_text_width())
-                .h(LINE_HEIGHT)
-                .line_height(LINE_HEIGHT)
-                .child(line.text),
-        )
-        .children(cursor_overlays.into_iter().map(render_cursor_overlay))
+    canvas(
+        move |bounds, window, _cx| prepaint_visual_line(line, bounds, window),
+        move |bounds, state, window, cx| {
+            let VisualLinePaintState {
+                line,
+                background_quads,
+                cursor_quads,
+            } = state;
+            for quad in background_quads {
+                window.paint_quad(quad);
+            }
+            if let Err(error) = line.paint(bounds.origin, LINE_HEIGHT, window, cx) {
+                eprintln!("mini_ui line paint failed: {error}");
+            }
+            for quad in cursor_quads {
+                window.paint_quad(quad);
+            }
+        },
+    )
+    .w(editor_text_width())
+    .h(LINE_HEIGHT)
+    .line_height(LINE_HEIGHT)
 }
 
-fn render_background_overlay(overlay: RenderedLineOverlay) -> impl IntoElement {
-    let color = match overlay.kind {
-        RenderedLineOverlayKind::Selection => rgb(0x264f78),
-        RenderedLineOverlayKind::Marked => rgb(0x3a2f14),
-        RenderedLineOverlayKind::Cursor { .. } => rgb(0x1f2328),
+fn prepaint_visual_line(
+    rendered_line: RenderedLine,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) -> VisualLinePaintState {
+    let line = shape_visual_line(&rendered_line.text, window);
+    let mut background_quads = Vec::new();
+    let mut cursor_quads = Vec::new();
+
+    for overlay in rendered_line.overlays() {
+        match overlay.kind {
+            RenderedLineOverlayKind::Selection => {
+                background_quads.push(pixel_overlay_quad(
+                    &rendered_line.text,
+                    &line,
+                    bounds,
+                    overlay,
+                    rgb(0x264f78),
+                ));
+            }
+            RenderedLineOverlayKind::Marked => {
+                background_quads.push(pixel_overlay_quad(
+                    &rendered_line.text,
+                    &line,
+                    bounds,
+                    overlay,
+                    rgb(0x3a2f14),
+                ));
+            }
+            RenderedLineOverlayKind::Cursor { active } => {
+                cursor_quads.push(pixel_overlay_quad(
+                    &rendered_line.text,
+                    &line,
+                    bounds,
+                    overlay,
+                    if active { rgb(0xf0f6fc) } else { rgb(0x8b949e) },
+                ));
+            }
+        }
+    }
+
+    VisualLinePaintState {
+        line,
+        background_quads,
+        cursor_quads,
+    }
+}
+
+fn shape_visual_line(text: &str, window: &mut Window) -> ShapedLine {
+    let style = window.text_style();
+    let shared_text: SharedString = text.to_string().into();
+    let run = TextRun {
+        len: shared_text.len(),
+        font: style.font(),
+        color: style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
     };
-
-    render_column_overlay(overlay, color.into())
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    window
+        .text_system()
+        .shape_line(shared_text, font_size, &[run], None)
 }
 
-fn render_column_overlay(overlay: RenderedLineOverlay, color: gpui::Hsla) -> impl IntoElement {
-    let width = if overlay.column_span == 0 {
+fn pixel_overlay_quad(
+    text: &str,
+    line: &ShapedLine,
+    bounds: Bounds<Pixels>,
+    overlay: RenderedLineOverlay,
+    color: impl Into<gpui::Background>,
+) -> PaintQuad {
+    let left = line_x_for_display_column(text, line, overlay.start_column);
+    let width = if matches!(overlay.kind, RenderedLineOverlayKind::Cursor { .. }) {
         CARET_WIDTH
     } else {
-        DISPLAY_COLUMN_WIDTH * overlay.column_span
+        let end_column = overlay.start_column + overlay.column_span;
+        line_x_for_display_column(text, line, end_column) - left
     };
 
-    div()
-        .absolute()
-        .top(px(0.0))
-        .left(DISPLAY_COLUMN_WIDTH * overlay.start_column)
-        .w(width)
-        .h(LINE_HEIGHT)
-        .bg(color)
+    let width = if width < CARET_WIDTH {
+        CARET_WIDTH
+    } else {
+        width
+    };
+
+    fill(
+        Bounds::new(
+            point(bounds.left() + left, bounds.top()),
+            size(width, LINE_HEIGHT),
+        ),
+        color,
+    )
 }
 
-fn render_cursor_overlay(overlay: RenderedLineOverlay) -> impl IntoElement {
-    let active = matches!(
-        overlay.kind,
-        RenderedLineOverlayKind::Cursor { active: true }
-    );
-
-    div()
-        .absolute()
-        .top(px(0.0))
-        .left(DISPLAY_COLUMN_WIDTH * overlay.start_column)
-        .w(CARET_WIDTH)
-        .h(LINE_HEIGHT)
-        .bg(if active { rgb(0xf0f6fc) } else { rgb(0x8b949e) })
+fn line_x_for_display_column(text: &str, line: &ShapedLine, display_column: usize) -> Pixels {
+    line.x_for_index(byte_offset_for_display_column_or_end(text, display_column))
 }
 
 fn render_scrollbar(scrollbar: RenderedScrollbar) -> impl IntoElement {
@@ -2669,6 +2723,46 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[gpui::test]
+    fn visual_line_caret_uses_shaped_text_widths(cx: &mut gpui::TestAppContext) {
+        let editor = EditorModel::for_buffer(
+            "scratch",
+            Buffer::local(BufferId::new(1).unwrap(), "a😀c").into_handle(),
+        );
+        let (_view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle);
+            EditorView::with_focus(editor, focus_handle)
+        });
+
+        cx.update(|window, _cx| {
+            let bounds = Bounds::new(Point::default(), size(editor_text_width(), LINE_HEIGHT));
+            let state = prepaint_visual_line(
+                RenderedLine {
+                    line_number: 1,
+                    text: "a😀c".to_string(),
+                    continuation: false,
+                    cursor_columns: vec![2],
+                    active_cursor_columns: vec![2],
+                    selection_ranges: vec![1..2],
+                    marked_ranges: Vec::new(),
+                },
+                bounds,
+                window,
+            );
+
+            assert_eq!(state.cursor_quads.len(), 1);
+            assert_eq!(state.background_quads.len(), 1);
+            let expected_caret_x = line_x_for_display_column("a😀c", &state.line, 2);
+            assert_eq!(state.cursor_quads[0].bounds.left(), expected_caret_x);
+            assert_eq!(
+                state.background_quads[0].bounds.left(),
+                line_x_for_display_column("a😀c", &state.line, 1)
+            );
+            assert!(expected_caret_x > DISPLAY_COLUMN_WIDTH * 2);
+        });
     }
 
     #[test]
