@@ -72,9 +72,9 @@ jobs:
               throw "Could not find workspace version in Cargo.toml"
             }
             $version = $match.Matches[0].Groups[1].Value
-            $expectedBranch = "release/$version"
-            if ($env:PR_HEAD_REF -ne $expectedBranch) {
-              throw "Release branch '$env:PR_HEAD_REF' does not match workspace version '$version'. Expected '$expectedBranch'."
+            $expectedBranches = @("release/$version", "release/v$version")
+            if ($env:PR_HEAD_REF -notin $expectedBranches) {
+              throw "Release branch '$env:PR_HEAD_REF' does not match workspace version '$version'. Expected one of: $($expectedBranches -join ', ')."
             }
             $shouldRelease = "true"
             $releaseTag = "v$version"
