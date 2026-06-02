@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+    types:
+      - closed
   workflow_dispatch:
     inputs:
       tag_name:
@@ -24,19 +30,64 @@ env:
   APP_CRATE: app
 
 jobs:
-  approval:
-    name: Wait for release approval
+  context:
+    name: Detect release context
     runs-on: ubuntu-latest
-    environment: release-approval
+    outputs:
+      release_tag: ${{ steps.context.outputs.release_tag }}
+      should_release: ${{ steps.context.outputs.should_release }}
 
     steps:
-      - name: Approved
-        run: echo "Release approved."
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.ref }}
+
+      - name: Detect release tag
+        id: context
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $shouldRelease = "false"
+          $releaseTag = ""
+
+          if ($env:EVENT_NAME -eq "push") {
+            $shouldRelease = "true"
+            $releaseTag = $env:REF_NAME
+          } elseif ($env:EVENT_NAME -eq "workflow_dispatch") {
+            $shouldRelease = "true"
+            $releaseTag = $env:INPUT_TAG_NAME
+          } elseif (
+            $env:EVENT_NAME -eq "pull_request" -and
+            $env:PR_MERGED -eq "true" -and
+            $env:PR_HEAD_REF.StartsWith("release/")
+          ) {
+            $match = Get-Content Cargo.toml | Select-String -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+            if (-not $match) {
+              throw "Could not find workspace version in Cargo.toml"
+            }
+            $version = $match.Matches[0].Groups[1].Value
+            $expectedBranch = "release/$version"
+            if ($env:PR_HEAD_REF -ne $expectedBranch) {
+              throw "Release branch '$env:PR_HEAD_REF' does not match workspace version '$version'. Expected '$expectedBranch'."
+            }
+            $shouldRelease = "true"
+            $releaseTag = "v$version"
+          }
+
+          "should_release=$shouldRelease" >> $env:GITHUB_OUTPUT
+          "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
 
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
-    needs: approval
+    needs: context
+    if: needs.context.outputs.should_release == 'true'
 
     strategy:
       fail-fast: false
@@ -61,6 +112,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.ref }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -155,7 +208,10 @@ jobs:
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    needs:
+      - context
+      - build
+    if: needs.context.outputs.should_release == 'true'
 
     steps:
       - name: Download release assets
@@ -167,8 +223,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
-          target_commitish: ${{ github.sha }}
+          tag_name: ${{ needs.context.outputs.release_tag }}
+          target_commitish: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           files: |
             dist/*.zip
             dist/*.tar.gz
