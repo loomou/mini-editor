@@ -300,6 +300,7 @@ impl Rope {
 #[cfg(test)]
 mod tests {
     use crate::{Rope, RopePoint};
+    use std::sync::Arc;
 
     #[test]
     fn splits_text_into_chunks() {
@@ -314,6 +315,20 @@ mod tests {
         let rope = Rope::from_text_with_chunk_size("abcdef".to_string(), 2);
 
         assert_eq!(rope.slice(1..5), "bcde");
+    }
+
+    #[test]
+    fn clones_share_rope_storage_for_snapshots() {
+        let rope = Rope::from_text_with_chunk_size("abcdef".to_string(), 2);
+        let clone = rope.clone();
+
+        assert!(Arc::ptr_eq(&rope.chunks, &clone.chunks));
+        assert!(
+            rope.root
+                .as_ref()
+                .zip(clone.root.as_ref())
+                .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
+        );
     }
 
     #[test]
