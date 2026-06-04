@@ -1,13 +1,16 @@
 use crate::Excerpt;
 use language::{BufferSnapshot, Capability};
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use text::{Anchor, BufferId};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MultiBufferSnapshot {
     pub(crate) excerpts: Vec<Excerpt>,
     pub(crate) buffers: BTreeMap<BufferId, BufferSnapshot>,
-    pub(crate) text: String,
+    excerpt_starts: Vec<usize>,
+    total_len: usize,
+    text: OnceLock<String>,
     pub(crate) capability: Capability,
 }
 
@@ -15,19 +18,43 @@ impl MultiBufferSnapshot {
     pub(crate) fn new(
         excerpts: Vec<Excerpt>,
         buffers: BTreeMap<BufferId, BufferSnapshot>,
-        text: String,
         capability: Capability,
     ) -> Self {
+        let mut excerpt_starts = Vec::with_capacity(excerpts.len());
+        let mut cursor = 0;
+        for (index, excerpt) in excerpts.iter().enumerate() {
+            if index > 0 {
+                cursor += 1;
+            }
+            excerpt_starts.push(cursor);
+            cursor += excerpt.range.context.len();
+        }
+
         Self {
             excerpts,
             buffers,
-            text,
+            excerpt_starts,
+            total_len: cursor,
+            text: OnceLock::new(),
             capability,
         }
     }
 
     pub fn text(&self) -> &str {
-        &self.text
+        self.text.get_or_init(|| {
+            self.excerpts
+                .iter()
+                .filter_map(|excerpt| {
+                    let buffer = self.buffers.get(&excerpt.buffer_id)?;
+                    Some(buffer.text.text_slice(excerpt.range.context.clone()))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.total_len
     }
 
     pub fn excerpts(&self) -> &[Excerpt] {
@@ -63,20 +90,14 @@ impl MultiBufferSnapshot {
     pub fn offset_for_anchor(&self, anchor: Anchor) -> Option<usize> {
         let buffer = self.buffers.get(&anchor.buffer_id())?;
         let buffer_offset = buffer.offset_for_anchor(anchor)?;
-        let mut cursor = 0;
-
-        for excerpt in &self.excerpts {
-            let len = excerpt.range.context.end - excerpt.range.context.start;
+        for (index, excerpt) in self.excerpts.iter().enumerate() {
             if excerpt.buffer_id == anchor.buffer_id()
                 && buffer_offset >= excerpt.range.context.start
                 && buffer_offset <= excerpt.range.context.end
             {
-                return Some(cursor + buffer_offset - excerpt.range.context.start);
-            }
-
-            cursor += len;
-            if cursor < self.text.len() {
-                cursor += 1;
+                return Some(
+                    self.excerpt_starts[index] + buffer_offset - excerpt.range.context.start,
+                );
             }
         }
 
@@ -84,18 +105,18 @@ impl MultiBufferSnapshot {
     }
 
     pub(crate) fn locate(&self, offset: usize) -> Option<(BufferId, usize)> {
-        let mut cursor = 0;
-        for excerpt in &self.excerpts {
-            let len = excerpt.range.context.end - excerpt.range.context.start;
-            if offset <= cursor + len {
+        if offset > self.total_len {
+            return None;
+        }
+
+        for (index, excerpt) in self.excerpts.iter().enumerate() {
+            let start = self.excerpt_starts[index];
+            let end = start + excerpt.range.context.len();
+            if offset <= end {
                 return Some((
                     excerpt.buffer_id,
-                    excerpt.range.context.start + offset - cursor,
+                    excerpt.range.context.start + offset.saturating_sub(start),
                 ));
-            }
-            cursor += len;
-            if cursor < self.text.len() {
-                cursor += 1;
             }
         }
         None

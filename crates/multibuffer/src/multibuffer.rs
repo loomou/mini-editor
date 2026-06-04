@@ -50,17 +50,8 @@ impl MultiBuffer {
             .iter()
             .map(|(id, buffer)| (*id, buffer.borrow().snapshot()))
             .collect::<BTreeMap<_, _>>();
-        let text = self
-            .excerpts
-            .iter()
-            .filter_map(|excerpt| {
-                let buffer = buffers.get(&excerpt.buffer_id)?;
-                Some(buffer.text.text_slice(excerpt.range.context.clone()))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
 
-        MultiBufferSnapshot::new(self.excerpts.clone(), buffers, text, self.capability)
+        MultiBufferSnapshot::new(self.excerpts.clone(), buffers, self.capability)
     }
 
     pub fn text_version_key(&self) -> Vec<(u64, u64)> {
