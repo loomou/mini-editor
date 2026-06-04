@@ -71,6 +71,22 @@ impl MultiBuffer {
         self.track_anchor(anchor)
     }
 
+    pub fn update_anchor_before(
+        &mut self,
+        handle: MultiBufferAnchor,
+        offset: usize,
+    ) -> Option<MultiBufferAnchor> {
+        self.update_anchor(handle, self.snapshot().anchor_before(offset)?)
+    }
+
+    pub fn update_anchor_after(
+        &mut self,
+        handle: MultiBufferAnchor,
+        offset: usize,
+    ) -> Option<MultiBufferAnchor> {
+        self.update_anchor(handle, self.snapshot().anchor_after(offset)?)
+    }
+
     pub fn anchor_for_handle(&self, anchor: MultiBufferAnchor) -> Option<Anchor> {
         self.buffers
             .get(&anchor.buffer_id)?
@@ -159,6 +175,24 @@ impl MultiBuffer {
             .borrow_mut()
             .track_anchor(anchor);
         Some(MultiBufferAnchor::new(buffer_id, anchor_index))
+    }
+
+    fn update_anchor(
+        &mut self,
+        handle: MultiBufferAnchor,
+        anchor: Anchor,
+    ) -> Option<MultiBufferAnchor> {
+        if handle.buffer_id == anchor.buffer_id()
+            && self
+                .buffers
+                .get(&handle.buffer_id)?
+                .borrow_mut()
+                .update_tracked_anchor(handle.anchor_index, anchor)
+        {
+            Some(handle)
+        } else {
+            self.track_anchor(anchor)
+        }
     }
 
     pub fn undo(&mut self) -> Result<bool, String> {

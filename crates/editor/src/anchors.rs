@@ -28,20 +28,44 @@ pub(crate) fn attach_selection_anchors(buffer: &mut MultiBuffer, selection: &mut
     let tail = selection.tail();
     let head = selection.head();
     let tail_anchor = if selection.is_empty() {
-        buffer.track_anchor_after(tail)
+        update_or_track_anchor_after(buffer, selection.tail_anchor, tail)
     } else if selection.reversed {
-        buffer.track_anchor_after(tail)
+        update_or_track_anchor_after(buffer, selection.tail_anchor, tail)
     } else {
-        buffer.track_anchor_before(tail)
+        update_or_track_anchor_before(buffer, selection.tail_anchor, tail)
     };
     let head_anchor = if selection.is_empty() || !selection.reversed {
-        buffer.track_anchor_after(head)
+        update_or_track_anchor_after(buffer, selection.head_anchor, head)
     } else {
-        buffer.track_anchor_before(head)
+        update_or_track_anchor_before(buffer, selection.head_anchor, head)
     };
 
     if let (Some(tail_anchor), Some(head_anchor)) = (tail_anchor, head_anchor) {
         selection.set_anchor_handles(tail_anchor, head_anchor);
+    }
+}
+
+fn update_or_track_anchor_before(
+    buffer: &mut MultiBuffer,
+    handle: Option<multibuffer::MultiBufferAnchor>,
+    offset: usize,
+) -> Option<multibuffer::MultiBufferAnchor> {
+    if let Some(handle) = handle {
+        buffer.update_anchor_before(handle, offset)
+    } else {
+        buffer.track_anchor_before(offset)
+    }
+}
+
+fn update_or_track_anchor_after(
+    buffer: &mut MultiBuffer,
+    handle: Option<multibuffer::MultiBufferAnchor>,
+    offset: usize,
+) -> Option<multibuffer::MultiBufferAnchor> {
+    if let Some(handle) = handle {
+        buffer.update_anchor_after(handle, offset)
+    } else {
+        buffer.track_anchor_after(offset)
     }
 }
 
@@ -111,5 +135,21 @@ mod tests {
         assert_eq!(selection.head(), 6);
         assert_eq!(selection.tail(), 12);
         assert!(selection.reversed);
+    }
+
+    #[test]
+    fn reattaching_selection_anchors_reuses_existing_handles() {
+        let buffer = Buffer::local(BufferId::new(1).unwrap(), "hello world");
+        let mut editor = EditorModel::for_buffer("scratch", buffer.into_handle());
+        editor.select(6..6);
+
+        let tail_anchor = editor.selections()[0].tail_anchor;
+        let head_anchor = editor.selections()[0].head_anchor;
+
+        editor.reattach_selection_anchors();
+        editor.reattach_selection_anchors();
+
+        assert_eq!(editor.selections()[0].tail_anchor, tail_anchor);
+        assert_eq!(editor.selections()[0].head_anchor, head_anchor);
     }
 }

@@ -41,6 +41,15 @@ impl Buffer {
         self.anchors.len() - 1
     }
 
+    pub fn update_tracked_anchor(&mut self, index: usize, anchor: Anchor) -> bool {
+        let Some(tracked_anchor) = self.anchors.get_mut(index) else {
+            return false;
+        };
+
+        *tracked_anchor = anchor;
+        true
+    }
+
     pub fn tracked_anchor(&self, index: usize) -> Option<Anchor> {
         self.anchors.get(index).copied()
     }

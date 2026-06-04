@@ -53,6 +53,10 @@ impl Buffer {
         self.text.track_anchor(anchor)
     }
 
+    pub fn update_tracked_anchor(&mut self, index: usize, anchor: Anchor) -> bool {
+        self.text.update_tracked_anchor(index, anchor)
+    }
+
     pub fn tracked_anchor(&self, index: usize) -> Option<Anchor> {
         self.text.tracked_anchor(index)
     }
