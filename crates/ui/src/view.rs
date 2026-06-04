@@ -3,6 +3,7 @@ use crate::{
     FocusHandle, Pixels, Point, RenderedEditor, RenderedLine, SelectionHistoryCheckpoint,
     display_range_for_source_range,
 };
+use display::DisplaySnapshot;
 use std::ops::Range;
 
 #[derive(Debug)]
@@ -109,7 +110,7 @@ impl EditorView {
             is_dirty: self.editor.is_dirty(),
             can_undo: self.editor.can_undo(),
             can_redo: self.editor.can_redo(),
-            lines: self.rendered_lines(soft_wrap_column),
+            lines: self.rendered_lines_for_display(&display),
             scrollbar: self.rendered_scrollbar_for_row_count(display.rows().len()),
         }
     }
@@ -125,8 +126,12 @@ impl EditorView {
 
     pub fn rendered_lines(&self, soft_wrap_column: Option<usize>) -> Vec<RenderedLine> {
         let display = self.editor.display_snapshot(soft_wrap_column);
-        let cursors = self.editor.cursor_display_points(soft_wrap_column);
-        let active_cursor = self.editor.cursor_display_point(soft_wrap_column).ok();
+        self.rendered_lines_for_display(&display)
+    }
+
+    fn rendered_lines_for_display(&self, display: &DisplaySnapshot) -> Vec<RenderedLine> {
+        let cursors = self.editor.cursor_display_points_in(display);
+        let active_cursor = self.editor.cursor_display_point_in(display).ok();
         let selections = self.editor.resolved_selections();
         let marked_range = self.marked_range.clone();
 

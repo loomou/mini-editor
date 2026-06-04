@@ -3,7 +3,7 @@ use crate::selection::{Selection, SelectionGoal};
 use crate::utils::{
     next_char_boundary, next_word_boundary, previous_char_boundary, previous_word_boundary,
 };
-use display::DisplayPoint;
+use display::{DisplayPoint, DisplaySnapshot};
 
 impl EditorModel {
     pub fn cursor_offset(&self) -> Result<usize, String> {
@@ -20,8 +20,20 @@ impl EditorModel {
             .display_point_for_source_offset(cursor))
     }
 
+    pub fn cursor_display_point_in(
+        &self,
+        display: &DisplaySnapshot,
+    ) -> Result<DisplayPoint, String> {
+        let cursor = self.cursor_offset()?;
+        Ok(display.display_point_for_source_offset(cursor))
+    }
+
     pub fn cursor_display_points(&self, soft_wrap_column: Option<usize>) -> Vec<DisplayPoint> {
         let display = self.display_snapshot(soft_wrap_column);
+        self.cursor_display_points_in(&display)
+    }
+
+    pub fn cursor_display_points_in(&self, display: &DisplaySnapshot) -> Vec<DisplayPoint> {
         self.resolved_selections()
             .into_iter()
             .map(|selection| display.display_point_for_source_offset(selection.head()))

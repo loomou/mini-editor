@@ -8,6 +8,7 @@ license.workspace = true
 doctest = false
 
 [dependencies]
+display.workspace = true
 editor.workspace = true
 
 gpui.workspace = true
