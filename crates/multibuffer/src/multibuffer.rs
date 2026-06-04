@@ -63,6 +63,13 @@ impl MultiBuffer {
         MultiBufferSnapshot::new(self.excerpts.clone(), buffers, text, self.capability)
     }
 
+    pub fn text_version_key(&self) -> Vec<(u64, u64)> {
+        self.buffers
+            .iter()
+            .map(|(id, buffer)| (id.get(), buffer.borrow().version()))
+            .collect()
+    }
+
     pub fn track_anchor_before(&mut self, offset: usize) -> Option<MultiBufferAnchor> {
         let anchor = self.snapshot().anchor_before(offset)?;
         self.track_anchor(anchor)

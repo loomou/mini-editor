@@ -28,6 +28,10 @@ impl Buffer {
         self.id
     }
 
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     pub fn snapshot(&self) -> BufferSnapshot {
         BufferSnapshot::new(self.id, self.text.clone(), self.version)
     }

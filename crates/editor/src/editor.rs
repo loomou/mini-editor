@@ -32,6 +32,10 @@ impl EditorModel {
         self.buffer.snapshot()
     }
 
+    pub fn text_version_key(&self) -> Vec<(u64, u64)> {
+        self.buffer.text_version_key()
+    }
+
     pub fn title(&self) -> String {
         self.snapshot()
             .excerpts()

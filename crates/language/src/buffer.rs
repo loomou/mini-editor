@@ -45,6 +45,10 @@ impl Buffer {
         self.text.id()
     }
 
+    pub fn version(&self) -> u64 {
+        self.text.version()
+    }
+
     pub fn track_anchor(&mut self, anchor: Anchor) -> usize {
         self.text.track_anchor(anchor)
     }
