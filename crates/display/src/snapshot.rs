@@ -1,19 +1,27 @@
 use crate::columns::{display_column_for_source_column, source_column_for_display_column};
 use crate::{DisplayPoint, DisplayRow};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct DisplaySnapshot {
-    pub(crate) rows: Vec<DisplayRow>,
+    pub(crate) rows: Arc<[DisplayRow]>,
     pub(crate) source_len: usize,
 }
 
 impl DisplaySnapshot {
     pub(crate) fn new(rows: Vec<DisplayRow>, source_len: usize) -> Self {
-        Self { rows, source_len }
+        Self {
+            rows: Arc::from(rows),
+            source_len,
+        }
     }
 
     pub fn rows(&self) -> &[DisplayRow] {
         &self.rows
+    }
+
+    pub fn shares_rows_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.rows, &other.rows)
     }
 
     pub fn source_len(&self) -> usize {
@@ -37,7 +45,7 @@ impl DisplaySnapshot {
 
     pub fn display_point_for_source_offset(&self, source_offset: usize) -> DisplayPoint {
         let source_offset = source_offset.min(self.source_len);
-        for row in &self.rows {
+        for row in self.rows.iter() {
             if source_offset >= row.source_range.start && source_offset <= row.source_range.end {
                 return DisplayPoint {
                     row: row.row,
