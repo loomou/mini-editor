@@ -6,12 +6,13 @@ use std::ops::Range;
 
 impl EditorView {
     pub(crate) fn dispatch_paste_text(&mut self, text: &str) -> Result<CommandOutcome, String> {
-        let before_text = self.editor.snapshot().text().to_string();
+        let before_text_version = self.editor.text_version_key();
         let before_selections = selection_state(&self.editor);
         let selections = self.editor.resolved_selections();
         let is_linewise_paste =
             is_linewise_paste(text, &selections, self.linewise_clipboard_text.as_deref());
         let replacements = if is_linewise_paste {
+            let before_text = self.editor.snapshot().text().to_string();
             let insert_ranges = line_start_ranges_for_offsets(
                 &before_text,
                 selections.iter().map(|selection| selection.head()),
@@ -30,10 +31,10 @@ impl EditorView {
         self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
         self.linewise_clipboard_text = None;
 
-        let after_text = self.editor.snapshot().text().to_string();
+        let after_text_version = self.editor.text_version_key();
         let after_selections = selection_state(&self.editor);
         Ok(CommandOutcome {
-            changed_text: before_text != after_text,
+            changed_text: before_text_version != after_text_version,
             moved_cursor: before_selections != after_selections,
         })
     }

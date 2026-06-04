@@ -28,6 +28,10 @@ impl Buffer {
         self.id
     }
 
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     pub fn snapshot(&self) -> BufferSnapshot {
         BufferSnapshot::new(self.id, self.text.clone(), self.version)
     }
@@ -35,6 +39,15 @@ impl Buffer {
     pub fn track_anchor(&mut self, anchor: Anchor) -> usize {
         self.anchors.push(anchor);
         self.anchors.len() - 1
+    }
+
+    pub fn update_tracked_anchor(&mut self, index: usize, anchor: Anchor) -> bool {
+        let Some(tracked_anchor) = self.anchors.get_mut(index) else {
+            return false;
+        };
+
+        *tracked_anchor = anchor;
+        true
     }
 
     pub fn tracked_anchor(&self, index: usize) -> Option<Anchor> {

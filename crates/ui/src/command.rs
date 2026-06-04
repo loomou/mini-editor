@@ -65,7 +65,7 @@ impl EditorView {
     }
 
     pub fn dispatch_command(&mut self, command: EditorCommand) -> Result<CommandOutcome, String> {
-        let before_text = self.editor.snapshot().text().to_string();
+        let before_text_version = self.editor.text_version_key();
         let before_selections = selection_state(&self.editor);
 
         let mut reveal_cursor = true;
@@ -155,10 +155,10 @@ impl EditorView {
         if reveal_cursor {
             self.reveal_active_cursor(Some(DEFAULT_SOFT_WRAP_COLUMN));
         }
-        let after_text = self.editor.snapshot().text().to_string();
+        let after_text_version = self.editor.text_version_key();
         let after_selections = selection_state(&self.editor);
         Ok(CommandOutcome {
-            changed_text: before_text != after_text,
+            changed_text: before_text_version != after_text_version,
             moved_cursor: before_selections != after_selections,
         })
     }

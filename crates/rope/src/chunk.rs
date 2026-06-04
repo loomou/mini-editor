@@ -1,9 +1,10 @@
 use crate::{RopePoint, TextSummary};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RopeChunk {
-    text: String,
-    line_breaks: Vec<usize>,
+    text: Arc<str>,
+    line_breaks: Arc<[usize]>,
     summary: TextSummary,
 }
 
@@ -13,12 +14,12 @@ impl RopeChunk {
             .bytes()
             .enumerate()
             .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset))
-            .collect();
+            .collect::<Vec<_>>();
         let summary = TextSummary::from_text(&text);
 
         Self {
-            text,
-            line_breaks,
+            text: Arc::from(text),
+            line_breaks: Arc::from(line_breaks),
             summary,
         }
     }
@@ -48,7 +49,7 @@ impl RopeChunk {
         let mut row = 0;
         let mut line_start = 0;
 
-        for line_break in &self.line_breaks {
+        for line_break in self.line_breaks.iter() {
             if *line_break >= clipped {
                 break;
             }
@@ -66,7 +67,7 @@ impl RopeChunk {
         let mut current_row = 0;
         let mut current_line_start = 0;
 
-        for line_break in &self.line_breaks {
+        for line_break in self.line_breaks.iter() {
             if current_row == point.row {
                 return (current_line_start + point.column).min(*line_break);
             }

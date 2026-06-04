@@ -50,17 +50,30 @@ impl MultiBuffer {
             .iter()
             .map(|(id, buffer)| (*id, buffer.borrow().snapshot()))
             .collect::<BTreeMap<_, _>>();
-        let text = self
-            .excerpts
-            .iter()
-            .filter_map(|excerpt| {
-                let buffer = buffers.get(&excerpt.buffer_id)?;
-                Some(buffer.text.text_slice(excerpt.range.context.clone()))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
 
-        MultiBufferSnapshot::new(self.excerpts.clone(), buffers, text, self.capability)
+        MultiBufferSnapshot::new(self.excerpts.clone(), buffers, self.capability)
+    }
+
+    pub fn text_version_key(&self) -> Vec<(u64, u64)> {
+        self.buffers
+            .iter()
+            .map(|(id, buffer)| (id.get(), buffer.borrow().version()))
+            .collect()
+    }
+
+    pub fn excerpt_version_key(&self) -> Vec<(u64, usize, usize, usize, usize)> {
+        self.excerpts
+            .iter()
+            .map(|excerpt| {
+                (
+                    excerpt.buffer_id.get(),
+                    excerpt.range.context.start,
+                    excerpt.range.context.end,
+                    excerpt.range.primary.start,
+                    excerpt.range.primary.end,
+                )
+            })
+            .collect()
     }
 
     pub fn track_anchor_before(&mut self, offset: usize) -> Option<MultiBufferAnchor> {
@@ -71,6 +84,22 @@ impl MultiBuffer {
     pub fn track_anchor_after(&mut self, offset: usize) -> Option<MultiBufferAnchor> {
         let anchor = self.snapshot().anchor_after(offset)?;
         self.track_anchor(anchor)
+    }
+
+    pub fn update_anchor_before(
+        &mut self,
+        handle: MultiBufferAnchor,
+        offset: usize,
+    ) -> Option<MultiBufferAnchor> {
+        self.update_anchor(handle, self.snapshot().anchor_before(offset)?)
+    }
+
+    pub fn update_anchor_after(
+        &mut self,
+        handle: MultiBufferAnchor,
+        offset: usize,
+    ) -> Option<MultiBufferAnchor> {
+        self.update_anchor(handle, self.snapshot().anchor_after(offset)?)
     }
 
     pub fn anchor_for_handle(&self, anchor: MultiBufferAnchor) -> Option<Anchor> {
@@ -161,6 +190,24 @@ impl MultiBuffer {
             .borrow_mut()
             .track_anchor(anchor);
         Some(MultiBufferAnchor::new(buffer_id, anchor_index))
+    }
+
+    fn update_anchor(
+        &mut self,
+        handle: MultiBufferAnchor,
+        anchor: Anchor,
+    ) -> Option<MultiBufferAnchor> {
+        if handle.buffer_id == anchor.buffer_id()
+            && self
+                .buffers
+                .get(&handle.buffer_id)?
+                .borrow_mut()
+                .update_tracked_anchor(handle.anchor_index, anchor)
+        {
+            Some(handle)
+        } else {
+            self.track_anchor(anchor)
+        }
     }
 
     pub fn undo(&mut self) -> Result<bool, String> {

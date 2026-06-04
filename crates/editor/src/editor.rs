@@ -1,6 +1,5 @@
 use crate::anchors::{attach_selection_anchors, resolve_selection_from_anchors};
-use crate::model::EditorModel;
-
+use crate::model::{CachedDisplaySnapshot, DisplayCacheKey, EditorModel};
 use crate::selection::{Selection, normalize_new_selections};
 use crate::selection_history::{
     SelectionHistoryCheckpoint, SelectionHistoryEntry, selection_history_key,
@@ -25,11 +24,16 @@ impl EditorModel {
             selection_redo_stack: Vec::new(),
             selection_only_undo_stack: Vec::new(),
             selection_only_redo_stack: Vec::new(),
+            display_cache: Default::default(),
         }
     }
 
     pub fn snapshot(&self) -> MultiBufferSnapshot {
         self.buffer.snapshot()
+    }
+
+    pub fn text_version_key(&self) -> Vec<(u64, u64)> {
+        self.buffer.text_version_key()
     }
 
     pub fn title(&self) -> String {
@@ -45,7 +49,23 @@ impl EditorModel {
     }
 
     pub fn display_snapshot(&self, soft_wrap_column: Option<usize>) -> DisplaySnapshot {
-        DisplayMap::new(soft_wrap_column).snapshot(&self.snapshot())
+        let key = DisplayCacheKey {
+            text_versions: self.buffer.text_version_key(),
+            excerpt_versions: self.buffer.excerpt_version_key(),
+            soft_wrap_column,
+        };
+        if let Some(cached) = self.display_cache.borrow().as_ref() {
+            if cached.key == key {
+                return cached.snapshot.clone();
+            }
+        }
+
+        let snapshot = DisplayMap::new(soft_wrap_column).snapshot(&self.snapshot());
+        *self.display_cache.borrow_mut() = Some(CachedDisplaySnapshot {
+            key,
+            snapshot: snapshot.clone(),
+        });
+        snapshot
     }
 
     pub fn source_offset_for_display_point(
@@ -346,5 +366,41 @@ mod tests {
         editor.refresh_buffer_ranges();
 
         assert_eq!(editor.cursor_offset().unwrap(), 3);
+    }
+
+    #[test]
+    fn display_snapshot_reuses_cached_rows_for_same_key() {
+        let buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            language::SourceFile::new("src/main.rs"),
+            "hello world",
+        )
+        .into_handle();
+        let editor = EditorModel::for_buffer("src/main.rs", buffer);
+
+        let first = editor.display_snapshot(Some(8));
+        let second = editor.display_snapshot(Some(8));
+
+        assert!(first.shares_rows_with(&second));
+    }
+
+    #[test]
+    fn display_snapshot_cache_key_tracks_text_version_and_wrap_column() {
+        let buffer = Buffer::from_file(
+            BufferId::new(1).unwrap(),
+            language::SourceFile::new("src/main.rs"),
+            "hello world",
+        )
+        .into_handle();
+        let mut editor = EditorModel::for_buffer("src/main.rs", buffer);
+
+        let wrapped = editor.display_snapshot(Some(8));
+        let differently_wrapped = editor.display_snapshot(Some(4));
+        assert!(!wrapped.shares_rows_with(&differently_wrapped));
+
+        editor.insert_text("!").unwrap();
+        let after_edit = editor.display_snapshot(Some(8));
+
+        assert!(!wrapped.shares_rows_with(&after_edit));
     }
 }

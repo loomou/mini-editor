@@ -1,4 +1,5 @@
-use crate::TextSummary;
+use crate::{RopeChunk, TextSummary};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RopeNode {
@@ -9,29 +10,26 @@ pub(crate) struct RopeNode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RopeNodeKind {
     Leaf {
-        chunk_index: usize,
+        chunk: RopeChunk,
     },
     Branch {
-        left: Box<RopeNode>,
-        right: Box<RopeNode>,
+        left: Arc<RopeNode>,
+        right: Arc<RopeNode>,
     },
 }
 
 impl RopeNode {
-    pub(crate) fn leaf(chunk_index: usize, summary: TextSummary) -> Self {
+    pub(crate) fn leaf(chunk: RopeChunk) -> Self {
         Self {
-            summary,
-            kind: RopeNodeKind::Leaf { chunk_index },
+            summary: chunk.summary(),
+            kind: RopeNodeKind::Leaf { chunk },
         }
     }
 
-    pub(crate) fn branch(left: RopeNode, right: RopeNode) -> Self {
+    pub(crate) fn branch(left: Arc<RopeNode>, right: Arc<RopeNode>) -> Self {
         Self {
             summary: left.summary.append(right.summary),
-            kind: RopeNodeKind::Branch {
-                left: Box::new(left),
-                right: Box::new(right),
-            },
+            kind: RopeNodeKind::Branch { left, right },
         }
     }
 
