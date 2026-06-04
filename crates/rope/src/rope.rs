@@ -1,17 +1,66 @@
 use crate::node::{RopeNode, RopeNodeKind};
 use crate::{RopeChunk, RopePoint, TextSummary};
+use std::fmt;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const DEFAULT_CHUNK_SIZE: usize = 32;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rope {
-    chunks: Arc<[RopeChunk]>,
+    chunks: OnceLock<Arc<[RopeChunk]>>,
     root: Option<Arc<RopeNode>>,
     len: usize,
     line_break_count: usize,
 }
+
+impl Clone for Rope {
+    fn clone(&self) -> Self {
+        let chunks = OnceLock::new();
+        if let Some(cached_chunks) = self.chunks.get() {
+            let _ = chunks.set(cached_chunks.clone());
+        }
+
+        Self {
+            chunks,
+            root: self.root.clone(),
+            len: self.len,
+            line_break_count: self.line_break_count,
+        }
+    }
+}
+
+impl fmt::Debug for Rope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Rope")
+            .field("chunks", &self.chunks())
+            .field("root", &self.root)
+            .field("len", &self.len)
+            .field("line_break_count", &self.line_break_count)
+            .finish()
+    }
+}
+
+impl Default for Rope {
+    fn default() -> Self {
+        Self {
+            chunks: OnceLock::new(),
+            root: None,
+            len: 0,
+            line_break_count: 0,
+        }
+    }
+}
+
+impl PartialEq for Rope {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.line_break_count == other.line_break_count
+            && self.chunks() == other.chunks()
+    }
+}
+
+impl Eq for Rope {}
 
 impl Rope {
     pub fn new(text: impl Into<String>) -> Self {
@@ -47,9 +96,11 @@ impl Rope {
         let len = chunks.iter().map(RopeChunk::len).sum();
         let line_break_count = chunks.iter().map(RopeChunk::line_break_count).sum();
         let root = Self::build_tree(&chunks, 0..chunks.len());
+        let chunk_cache = OnceLock::new();
+        let _ = chunk_cache.set(chunks);
 
         Self {
-            chunks,
+            chunks: chunk_cache,
             root,
             len,
             line_break_count,
@@ -82,7 +133,13 @@ impl Rope {
     }
 
     pub fn chunks(&self) -> &[RopeChunk] {
-        &self.chunks
+        self.chunks.get_or_init(|| {
+            let mut chunks = Vec::new();
+            if let Some(root) = &self.root {
+                Self::collect_chunks(root, &mut chunks);
+            }
+            Arc::from(chunks)
+        })
     }
 
     pub fn summary(&self) -> TextSummary {
@@ -97,11 +154,11 @@ impl Rope {
     }
 
     pub fn chunk_texts(&self) -> Vec<&str> {
-        self.chunks.iter().map(RopeChunk::text).collect()
+        self.chunks().iter().map(RopeChunk::text).collect()
     }
 
     pub fn text(&self) -> String {
-        self.chunks.iter().map(RopeChunk::text).collect()
+        self.chunks().iter().map(RopeChunk::text).collect()
     }
 
     pub fn slice(&self, range: Range<usize>) -> String {
@@ -110,7 +167,7 @@ impl Rope {
 
         let mut output = String::new();
         let mut chunk_start = 0;
-        for chunk in self.chunks.iter() {
+        for chunk in self.chunks().iter() {
             let chunk_end = chunk_start + chunk.len();
             let start = range.start.max(chunk_start);
             let end = range.end.min(chunk_end);
@@ -157,11 +214,9 @@ impl Rope {
             return Self::default();
         };
 
-        let mut chunks = Vec::new();
-        Self::collect_chunks(&root, &mut chunks);
         let summary = root.summary;
         Self {
-            chunks: Arc::from(chunks),
+            chunks: OnceLock::new(),
             root: Some(root),
             len: summary.len,
             line_break_count: summary.line_break_count,
@@ -322,7 +377,10 @@ mod tests {
         let rope = Rope::from_text_with_chunk_size("abcdef".to_string(), 2);
         let clone = rope.clone();
 
-        assert!(Arc::ptr_eq(&rope.chunks, &clone.chunks));
+        assert!(Arc::ptr_eq(
+            rope.chunks.get().unwrap(),
+            clone.chunks.get().unwrap()
+        ));
         assert!(
             rope.root
                 .as_ref()
@@ -358,6 +416,16 @@ mod tests {
 
         assert_eq!(rope.text(), "abcdefghijzeduvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ");
         assert!(rope.chunks().len() > 1);
+    }
+
+    #[test]
+    fn replace_defers_rebuilding_the_chunk_view() {
+        let mut rope = Rope::from_text_with_chunk_size("abcdef".to_string(), 2);
+
+        rope.replace(2..4, "XY");
+
+        assert!(rope.chunks.get().is_none());
+        assert_eq!(rope.text(), "abXYef");
     }
 
     #[test]
